@@ -4,8 +4,8 @@ from __future__ import annotations
 Anchor-Free training entrypoint (FCOS/YOLOX-style simplified).
 
 Enhancements in this version:
+- FCOS-style target assignment on grid centers inside each bbox.
 - Stronger image preprocessing/augmentation.
-- Center-sampling target assignment in dataset.
 - EMA model weights for stabler validation and checkpoint selection.
 - Separate LR for backbone/head + warmup + cosine schedule.
 """
@@ -70,7 +70,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--backbone_lr_mult", type=float, default=0.35)
     p.add_argument("--warmup_epochs", type=int, default=4)
     p.add_argument("--ema_decay", type=float, default=0.9995)
-    p.add_argument("--center_sampling_radius", type=float, default=1.5)
 
     p.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     p.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
@@ -141,6 +140,7 @@ def train_one_epoch(
     optimizer: optim.Optimizer,
     device: torch.device,
     scaler: Optional[torch.cuda.amp.GradScaler],
+    stride: float,
     ema: Optional[ModelEMA] = None,
 ) -> Tuple[float, Dict[str, float]]:
     model.train()
@@ -156,7 +156,7 @@ def train_one_epoch(
         if scaler is not None:
             with torch.cuda.amp.autocast():
                 outputs = model(images)
-                loss, parts = compute_loss(outputs, targets)
+                loss, parts = compute_loss(outputs, targets, stride=stride)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=8.0)
@@ -164,7 +164,7 @@ def train_one_epoch(
             scaler.update()
         else:
             outputs = model(images)
-            loss, parts = compute_loss(outputs, targets)
+            loss, parts = compute_loss(outputs, targets, stride=stride)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=8.0)
             optimizer.step()
@@ -183,7 +183,12 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate_loss(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, Dict[str, float]]:
+def validate_loss(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    stride: float,
+) -> Tuple[float, Dict[str, float]]:
     model.eval()
     total = 0.0
     n = 0
@@ -193,7 +198,7 @@ def validate_loss(model: torch.nn.Module, loader: DataLoader, device: torch.devi
         images = images.to(device)
         targets = move_targets_to_device(targets, device)
         outputs = model(images)
-        loss, parts = compute_loss(outputs, targets)
+        loss, parts = compute_loss(outputs, targets, stride=stride)
 
         total += float(loss.item())
         for k in parts_sum:
@@ -254,7 +259,6 @@ def main() -> None:
         transforms=get_train_transforms(args.img_size),
         img_size=args.img_size,
         grid_size=args.grid_size,
-        center_sampling_radius=args.center_sampling_radius,
     )
     val_ds = DetectionDataset(
         ann_path=args.val_data,
@@ -262,7 +266,6 @@ def main() -> None:
         transforms=get_val_transforms(args.img_size),
         img_size=args.img_size,
         grid_size=args.grid_size,
-        center_sampling_radius=args.center_sampling_radius,
     )
 
     use_pin_memory = device.type == "cuda"
@@ -323,10 +326,19 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
-        tr_loss, tr_parts = train_one_epoch(model, train_loader, optimizer, device, scaler, ema=ema)
+        stride = float(args.img_size / args.grid_size)
+        tr_loss, tr_parts = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            scaler,
+            stride=stride,
+            ema=ema,
+        )
 
         eval_model = ema.ema if ema is not None else model
-        va_loss, va_parts = validate_loss(eval_model, val_loader, device)
+        va_loss, va_parts = validate_loss(eval_model, val_loader, device, stride=stride)
         scheduler.step()
 
         score = -va_loss

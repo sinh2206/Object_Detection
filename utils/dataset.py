@@ -12,7 +12,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from .anchor_utils import compute_centerness
-from .config import CLASS_TO_IDX, GRID_SIZE, IMG_SIZE, NUM_CLASSES
+from .config import CLASS_TO_IDX, GRID_SIZE, IMG_SIZE, MEAN, NUM_CLASSES, STD
 
 
 class DetectionDataset(Dataset):
@@ -23,7 +23,7 @@ class DetectionDataset(Dataset):
         transforms: Optional[Callable] = None,
         img_size: int = IMG_SIZE,
         grid_size: int = GRID_SIZE,
-        center_sampling_radius: float = 1.5,
+        center_sampling_radius: Optional[float] = None,
     ):
         with open(ann_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -33,7 +33,6 @@ class DetectionDataset(Dataset):
         self.img_size = int(img_size)
         self.grid_size = int(grid_size)
         self.stride = float(self.img_size / self.grid_size)
-        self.center_sampling_radius = float(center_sampling_radius)
 
         self.img_info = {img["id"]: img for img in data["images"]}
         self.ann_map = defaultdict(list)
@@ -53,40 +52,26 @@ class DetectionDataset(Dataset):
         pos_mask = np.zeros((1, g, g), dtype=np.float32)
 
         area_map = np.full((g, g), np.inf, dtype=np.float32)
-        center_radius_px = self.center_sampling_radius * self.stride
-
         for bbox, label in zip(bboxes, labels):
             x1, y1, x2, y2 = [float(v) for v in bbox]
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            cx = 0.5 * (x1 + x2)
-            cy = 0.5 * (y1 + y2)
             area = (x2 - x1) * (y2 - y1)
             if area <= 0.0:
                 continue
 
-            gx_min = max(int(np.floor(x1 / self.stride)), 0)
-            gy_min = max(int(np.floor(y1 / self.stride)), 0)
-            gx_max = min(int(np.floor((x2 - 1e-6) / self.stride)), g - 1)
-            gy_max = min(int(np.floor((y2 - 1e-6) / self.stride)), g - 1)
+            gx_min = max(int(np.ceil((x1 / self.stride) - 0.5)), 0)
+            gy_min = max(int(np.ceil((y1 / self.stride) - 0.5)), 0)
+            gx_max = min(int(np.floor((x2 / self.stride) - 0.5)), g - 1)
+            gy_max = min(int(np.floor((y2 / self.stride) - 0.5)), g - 1)
             if gx_max < gx_min or gy_max < gy_min:
                 continue
 
-            cx_min = cx - center_radius_px
-            cy_min = cy - center_radius_px
-            cx_max = cx + center_radius_px
-            cy_max = cy + center_radius_px
-
             for gy in range(gy_min, gy_max + 1):
                 cell_cy = (gy + 0.5) * self.stride
-                if cell_cy < cy_min or cell_cy > cy_max:
-                    continue
-
                 for gx in range(gx_min, gx_max + 1):
                     cell_cx = (gx + 0.5) * self.stride
-                    if cell_cx < cx_min or cell_cx > cx_max:
-                        continue
 
                     l = cell_cx - x1
                     t = cell_cy - y1
@@ -101,8 +86,7 @@ class DetectionDataset(Dataset):
                     area_map[gy, gx] = area
                     cls_target[:, gy, gx] = 0.0
                     cls_target[label, gy, gx] = 1.0
-                    # Normalize ltrb by stride to stabilize regression optimization.
-                    reg_target[:, gy, gx] = np.array([l, t, r, b], dtype=np.float32) / float(self.stride)
+                    reg_target[:, gy, gx] = np.array([l, t, r, b], dtype=np.float32)
                     center_target[0, gy, gx] = compute_centerness(l, t, r, b)
                     pos_mask[0, gy, gx] = 1.0
 
@@ -147,7 +131,9 @@ class DetectionDataset(Dataset):
             labels = [int(v) for v in transformed["class_labels"]]
         else:
             image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-            image_tensor = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
+            arr = image.astype(np.float32) / 255.0
+            arr = (arr - np.array(MEAN, dtype=np.float32)) / np.array(STD, dtype=np.float32)
+            image_tensor = torch.from_numpy(arr.transpose(2, 0, 1)).float()
 
         valid_boxes: List[List[float]] = []
         valid_labels: List[int] = []

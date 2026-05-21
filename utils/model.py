@@ -56,11 +56,13 @@ class DetectionHead(nn.Module):
         cls_logits = self.cls_out(cls_feat)
         reg_preds = F.relu(self.reg_out(reg_feat))
         center_logits = self.center_out(reg_feat)
+        center_probs = torch.sigmoid(center_logits)
 
         return {
             "cls_logits": cls_logits,
             "reg_preds": reg_preds,
             "center_logits": center_logits,
+            "center_probs": center_probs,
         }
 
 
@@ -68,7 +70,7 @@ class AnchorFreeDetector(nn.Module):
     def __init__(
         self,
         num_classes: int = NUM_CLASSES,
-        backbone_name: str = "resnet18",
+        backbone_name: str = "resnet34",
         feat_channels: int = FPN_CHANNELS,
         pretrained: bool = True,
     ):
@@ -78,10 +80,9 @@ class AnchorFreeDetector(nn.Module):
 
         if backbone_name == "resnet34":
             backbone = self._build_resnet34(pretrained)
-            out_ch = 512
         else:
             backbone = self._build_resnet18(pretrained)
-            out_ch = 512
+        out_ch = 512
 
         self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
         self.layer1 = backbone.layer1
@@ -89,10 +90,7 @@ class AnchorFreeDetector(nn.Module):
         self.layer3 = backbone.layer3
         self.layer4 = backbone.layer4
 
-        self.neck = nn.Sequential(
-            ConvBNAct(out_ch, feat_channels, k=1, s=1, p=0),
-            ConvBNAct(feat_channels, feat_channels, k=3, s=1, p=1),
-        )
+        self.head_in = ConvBNAct(out_ch, feat_channels, k=1, s=1, p=0)
         self.head = DetectionHead(feat_channels, num_classes)
 
     @staticmethod
@@ -129,5 +127,11 @@ class AnchorFreeDetector(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        x = self.neck(x)
-        return self.head(x)
+        x = self.head_in(x)
+        outputs = self.head(x)
+        pred = torch.cat(
+            [outputs["cls_logits"], outputs["reg_preds"], outputs["center_logits"]],
+            dim=1,
+        ).permute(0, 2, 3, 1)
+        outputs["pred"] = pred
+        return outputs

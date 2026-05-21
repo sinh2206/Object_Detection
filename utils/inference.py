@@ -22,41 +22,21 @@ from .config import (
 )
 
 
-def _letterbox_image(
-    image: Image.Image,
-    img_size: int,
-    fill: Tuple[int, int, int] = (114, 114, 114),
-) -> Tuple[Image.Image, Dict[str, float]]:
+def preprocess_image(image_path: Path, img_size: int = IMG_SIZE) -> Tuple[torch.Tensor, Dict[str, float]]:
+    image = Image.open(image_path).convert("RGB")
     orig_w, orig_h = image.size
-    scale = min(float(img_size) / float(orig_w), float(img_size) / float(orig_h))
-    new_w = max(1, int(round(orig_w * scale)))
-    new_h = max(1, int(round(orig_h * scale)))
 
-    resized = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
-    canvas = Image.new("RGB", (img_size, img_size), color=fill)
-    pad_x = int((img_size - new_w) // 2)
-    pad_y = int((img_size - new_h) // 2)
-    canvas.paste(resized, (pad_x, pad_y))
+    resized = image.resize((img_size, img_size), Image.Resampling.BILINEAR)
+    arr = np.asarray(resized, dtype=np.float32) / 255.0
+    arr = (arr - np.array(MEAN, dtype=np.float32)) / np.array(STD, dtype=np.float32)
 
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
     meta = {
         "orig_w": float(orig_w),
         "orig_h": float(orig_h),
-        "scale": float(scale),
-        "pad_x": float(pad_x),
-        "pad_y": float(pad_y),
-        "new_w": float(new_w),
-        "new_h": float(new_h),
+        "sx": float(orig_w) / float(img_size),
+        "sy": float(orig_h) / float(img_size),
     }
-    return canvas, meta
-
-
-def preprocess_image(image_path: Path, img_size: int = IMG_SIZE) -> Tuple[torch.Tensor, Dict[str, float]]:
-    image = Image.open(image_path).convert("RGB")
-    canvas, meta = _letterbox_image(image=image, img_size=img_size)
-
-    arr = np.asarray(canvas, dtype=np.float32) / 255.0
-    arr = (arr - np.array(MEAN, dtype=np.float32)) / np.array(STD, dtype=np.float32)
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
     return tensor, meta
 
 
@@ -65,12 +45,11 @@ def _decode_single(
     img_size: int,
     stride: float,
     conf_thresh: float,
-    topk_per_class: int = 500,
-    min_box_size: float = 2.0,
+    min_box_size: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    cls_prob = torch.sigmoid(outputs["cls_logits"][0])
-    reg = outputs["reg_preds"][0]
-    center_prob = torch.sigmoid(outputs["center_logits"][0, 0])
+    cls_prob = torch.sigmoid(outputs["cls_logits"][0])  # [C,H,W]
+    reg = outputs["reg_preds"][0]  # [4,H,W], already >=0 due ReLU
+    center_prob = torch.sigmoid(outputs["center_logits"][0, 0])  # [H,W]
 
     num_classes, h, w = cls_prob.shape
     device = cls_prob.device
@@ -88,23 +67,18 @@ def _decode_single(
 
         ys, xs = torch.where(mask)
         scores = score_map[ys, xs]
-        if topk_per_class > 0 and scores.numel() > topk_per_class:
-            scores, topk_idx = torch.topk(scores, k=topk_per_class, dim=0, largest=True, sorted=False)
-            ys = ys[topk_idx]
-            xs = xs[topk_idx]
 
-        l = reg[0, ys, xs] * stride
-        t = reg[1, ys, xs] * stride
-        r = reg[2, ys, xs] * stride
-        b = reg[3, ys, xs] * stride
+        l = reg[0, ys, xs]
+        t = reg[1, ys, xs]
+        r = reg[2, ys, xs]
+        b = reg[3, ys, xs]
 
         cx = gx[ys, xs]
         cy = gy[ys, xs]
-
-        x1 = (cx - l).clamp(0, img_size)
-        y1 = (cy - t).clamp(0, img_size)
-        x2 = (cx + r).clamp(0, img_size)
-        y2 = (cy + b).clamp(0, img_size)
+        x1 = (cx - l).clamp(0.0, float(img_size))
+        y1 = (cy - t).clamp(0.0, float(img_size))
+        x2 = (cx + r).clamp(0.0, float(img_size))
+        y2 = (cy + b).clamp(0.0, float(img_size))
 
         keep = ((x2 - x1) >= min_box_size) & ((y2 - y1) >= min_box_size)
         if not keep.any():
@@ -136,17 +110,12 @@ def _remap_to_original(boxes: np.ndarray, meta: Dict[str, float]) -> np.ndarray:
         return boxes
 
     boxes = boxes.copy().astype(np.float32)
-    boxes[:, [0, 2]] = (boxes[:, [0, 2]] - meta["pad_x"]) / max(meta["scale"], 1e-6)
-    boxes[:, [1, 3]] = (boxes[:, [1, 3]] - meta["pad_y"]) / max(meta["scale"], 1e-6)
+    boxes[:, [0, 2]] *= meta["sx"]
+    boxes[:, [1, 3]] *= meta["sy"]
 
     boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0.0, meta["orig_w"])
     boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0.0, meta["orig_h"])
-
-    x1 = np.minimum(boxes[:, 0], boxes[:, 2])
-    y1 = np.minimum(boxes[:, 1], boxes[:, 3])
-    x2 = np.maximum(boxes[:, 0], boxes[:, 2])
-    y2 = np.maximum(boxes[:, 1], boxes[:, 3])
-    return np.stack([x1, y1, x2, y2], axis=1)
+    return boxes
 
 
 def _nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> np.ndarray:
@@ -157,11 +126,10 @@ def _nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> np.n
     y1 = boxes[:, 1]
     x2 = boxes[:, 2]
     y2 = boxes[:, 3]
-
     areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
     order = scores.argsort()[::-1]
 
-    keep: List[int] = []
+    keep = []
     while order.size > 0:
         i = int(order[0])
         keep.append(i)
@@ -175,7 +143,6 @@ def _nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> np.n
         h = np.maximum(0.0, yy2 - yy1)
         inter = w * h
         iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-
         order = order[1:][iou < iou_thresh]
 
     return np.asarray(keep, dtype=np.int64)
@@ -197,13 +164,6 @@ def apply_per_class_nms(
         mask = cls_ids == c
         b = boxes[mask]
         s = scores[mask]
-
-        valid = np.isfinite(b).all(axis=1) & ((b[:, 2] - b[:, 0]) > 1.0) & ((b[:, 3] - b[:, 1]) > 1.0)
-        b = b[valid]
-        s = s[valid]
-        if len(b) == 0:
-            continue
-
         keep = _nms_numpy(b, s, iou_thresh=iou_thresh)
         for idx in keep:
             results.append(
@@ -215,9 +175,7 @@ def apply_per_class_nms(
             )
 
     results.sort(key=lambda x: x["confidence"], reverse=True)
-    if max_detections > 0:
-        results = results[:max_detections]
-    return results
+    return results[:max_detections]
 
 
 @torch.no_grad()
@@ -230,50 +188,22 @@ def predict_single_image(
     conf_thresh: float = CONF_THRESH,
     nms_iou_thresh: float = NMS_IOU_THRESH,
     class_names: List[str] = CLASS_NAMES,
-    topk_per_class: int = 500,
+    min_box_size: float = 1.0,
     max_detections: int = 100,
-    min_box_size: float = 2.0,
-    tta_flip: bool = True,
 ) -> List[Dict[str, Any]]:
     image_path = Path(image_path)
     image_t, meta = preprocess_image(image_path, img_size=img_size)
-
     outputs = model(image_t.to(device))
+
     boxes, scores, cls_ids = _decode_single(
         outputs=outputs,
         img_size=img_size,
         stride=float(stride),
         conf_thresh=conf_thresh,
-        topk_per_class=topk_per_class,
         min_box_size=min_box_size,
     )
-
-    if tta_flip:
-        flip_t = torch.flip(image_t, dims=[3])
-        outputs_f = model(flip_t.to(device))
-        b2, s2, c2 = _decode_single(
-            outputs=outputs_f,
-            img_size=img_size,
-            stride=float(stride),
-            conf_thresh=conf_thresh,
-            topk_per_class=topk_per_class,
-            min_box_size=min_box_size,
-        )
-        if len(b2) > 0:
-            b2 = b2.copy()
-            x1 = b2[:, 0].copy()
-            x2 = b2[:, 2].copy()
-            b2[:, 0] = float(img_size) - x2
-            b2[:, 2] = float(img_size) - x1
-
-        if len(b2) > 0 and len(boxes) > 0:
-            boxes = np.concatenate([boxes, b2], axis=0)
-            scores = np.concatenate([scores, s2], axis=0)
-            cls_ids = np.concatenate([cls_ids, c2], axis=0)
-        elif len(b2) > 0:
-            boxes, scores, cls_ids = b2, s2, c2
-
     boxes = _remap_to_original(boxes, meta)
+
     return apply_per_class_nms(
         boxes=boxes,
         scores=scores,
@@ -294,10 +224,8 @@ def predict_images(
     conf_thresh: float = CONF_THRESH,
     nms_iou_thresh: float = NMS_IOU_THRESH,
     class_names: List[str] = CLASS_NAMES,
-    topk_per_class: int = 500,
+    min_box_size: float = 1.0,
     max_detections: int = 100,
-    min_box_size: float = 2.0,
-    tta_flip: bool = True,
 ) -> List[Dict[str, Any]]:
     folder = Path(image_dir)
     if not folder.exists():
@@ -319,10 +247,8 @@ def predict_images(
                 conf_thresh=conf_thresh,
                 nms_iou_thresh=nms_iou_thresh,
                 class_names=class_names,
-                topk_per_class=topk_per_class,
-                max_detections=max_detections,
                 min_box_size=min_box_size,
-                tta_flip=tta_flip,
+                max_detections=max_detections,
             )
             results.append({"image_id": image_id, "boxes": boxes})
         except Exception as exc:
