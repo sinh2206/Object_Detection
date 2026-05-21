@@ -23,6 +23,7 @@ class DetectionDataset(Dataset):
         transforms: Optional[Callable] = None,
         img_size: int = IMG_SIZE,
         grid_size: int = GRID_SIZE,
+        center_sampling_radius: float = 1.5,
     ):
         with open(ann_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -32,6 +33,7 @@ class DetectionDataset(Dataset):
         self.img_size = int(img_size)
         self.grid_size = int(grid_size)
         self.stride = float(self.img_size / self.grid_size)
+        self.center_sampling_radius = float(center_sampling_radius)
 
         self.img_info = {img["id"]: img for img in data["images"]}
         self.ann_map = defaultdict(list)
@@ -51,6 +53,7 @@ class DetectionDataset(Dataset):
         pos_mask = np.zeros((1, g, g), dtype=np.float32)
 
         area_map = np.full((g, g), np.inf, dtype=np.float32)
+        center_radius_px = self.center_sampling_radius * self.stride
 
         for bbox, label in zip(bboxes, labels):
             x1, y1, x2, y2 = [float(v) for v in bbox]
@@ -59,31 +62,49 @@ class DetectionDataset(Dataset):
 
             cx = 0.5 * (x1 + x2)
             cy = 0.5 * (y1 + y2)
-
-            gx = int(np.clip(cx / self.stride, 0, g - 1))
-            gy = int(np.clip(cy / self.stride, 0, g - 1))
-
-            cell_cx = (gx + 0.5) * self.stride
-            cell_cy = (gy + 0.5) * self.stride
-
-            l = cell_cx - x1
-            t = cell_cy - y1
-            r = x2 - cell_cx
-            b = y2 - cell_cy
-            if min(l, t, r, b) <= 0.0:
-                continue
-
             area = (x2 - x1) * (y2 - y1)
-            if area >= area_map[gy, gx]:
+            if area <= 0.0:
                 continue
 
-            area_map[gy, gx] = area
-            cls_target[:, gy, gx] = 0.0
-            cls_target[label, gy, gx] = 1.0
-            # Normalize ltrb by stride to stabilize regression optimization.
-            reg_target[:, gy, gx] = np.array([l, t, r, b], dtype=np.float32) / float(self.stride)
-            center_target[0, gy, gx] = compute_centerness(l, t, r, b)
-            pos_mask[0, gy, gx] = 1.0
+            gx_min = max(int(np.floor(x1 / self.stride)), 0)
+            gy_min = max(int(np.floor(y1 / self.stride)), 0)
+            gx_max = min(int(np.floor((x2 - 1e-6) / self.stride)), g - 1)
+            gy_max = min(int(np.floor((y2 - 1e-6) / self.stride)), g - 1)
+            if gx_max < gx_min or gy_max < gy_min:
+                continue
+
+            cx_min = cx - center_radius_px
+            cy_min = cy - center_radius_px
+            cx_max = cx + center_radius_px
+            cy_max = cy + center_radius_px
+
+            for gy in range(gy_min, gy_max + 1):
+                cell_cy = (gy + 0.5) * self.stride
+                if cell_cy < cy_min or cell_cy > cy_max:
+                    continue
+
+                for gx in range(gx_min, gx_max + 1):
+                    cell_cx = (gx + 0.5) * self.stride
+                    if cell_cx < cx_min or cell_cx > cx_max:
+                        continue
+
+                    l = cell_cx - x1
+                    t = cell_cy - y1
+                    r = x2 - cell_cx
+                    b = y2 - cell_cy
+                    if min(l, t, r, b) <= 0.0:
+                        continue
+
+                    if area >= area_map[gy, gx]:
+                        continue
+
+                    area_map[gy, gx] = area
+                    cls_target[:, gy, gx] = 0.0
+                    cls_target[label, gy, gx] = 1.0
+                    # Normalize ltrb by stride to stabilize regression optimization.
+                    reg_target[:, gy, gx] = np.array([l, t, r, b], dtype=np.float32) / float(self.stride)
+                    center_target[0, gy, gx] = compute_centerness(l, t, r, b)
+                    pos_mask[0, gy, gx] = 1.0
 
         return {
             "cls": torch.from_numpy(cls_target),
