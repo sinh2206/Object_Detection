@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val_image_dir",  required=True,  help="Path to val images directory")
     p.add_argument("--checkpoint_dir", default="./models", help="Where to save checkpoints")
     # training hyper-params
-    p.add_argument("--epochs",      type=int,   default=80,   help="Total training epochs")
+    p.add_argument("--epochs",      type=int,   default=40,   help="Total training epochs")
     p.add_argument("--batch_size",  type=int,   default=16,   help="Batch size")
     p.add_argument("--img_size",    type=int,   default=IMG_SIZE, help="Input image size")
     p.add_argument("--lr",          type=float, default=1e-3, help="Initial learning rate")
