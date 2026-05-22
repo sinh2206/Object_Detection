@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 NUM_CLASSES = 5
 CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
