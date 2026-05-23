@@ -171,7 +171,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Predict with anchor-free detector and export JSON.")
     parser.add_argument("--image_dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("predictions.json"))
-    parser.add_argument("--checkpoint", type=Path, default=Path("models/best.pth"))
+    parser.add_argument(
+        "--checkpoint",
+        "--model_path",
+        dest="checkpoint",
+        type=Path,
+        default=Path("models/best.pth"),
+        help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
+    )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
