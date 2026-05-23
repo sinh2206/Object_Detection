@@ -1,125 +1,84 @@
-"""
-predict.py  –  Object Detection Inference Script
-
-Usage:
-    python predict.py \
-        --image_dir /path/to/images \
-        --output    predictions.json \
-        [--checkpoint ./models/best.pth] \
-        [--conf_thresh 0.30] \
-        [--nms_thresh  0.50] \
-        [--img_size    448]
-
-Output format (predictions.json):
-[
-  {
-    "image_id": "img_xxxx.jpg",
-    "boxes": [
-      {"class": "person", "confidence": 0.91, "bbox": [48, 72, 210, 356]},
-      ...
-    ]
-  },
-  ...
-]
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List, Optional, Sequence, Tuple
 
+import cv2
+import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
-from utils.config import (
-    CLASS_NAMES,
-    CONF_THRESH,
-    FEATURE_STRIDE,
-    IMG_SIZE,
-    NMS_IOU_THRESH,
-    NUM_CLASSES,
-    VALID_IMAGE_EXTS,
-)
-from utils.inference import predict_single_image
+from utils.config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, MEAN, NMS_IOU_THRESH, NUM_CLASSES, STD
 from utils.model import AnchorFreeDetector
+from utils.nms import LetterboxMeta, postprocess_batch
+
+VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Args
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run inference and output predictions.json")
-    p.add_argument("--image_dir",  required=True, help="Directory of images to predict")
-    p.add_argument("--output",     default="predictions.json",
-                   help="Output JSON file path")
-    p.add_argument("--checkpoint", default="./models/best.pth",
-                   help="Path to model checkpoint (.pth)")
-    p.add_argument("--backbone",   default="resnet34",
-                   choices=["resnet34", "resnet18"])
-    p.add_argument("--img_size",   type=int,   default=IMG_SIZE)
-    p.add_argument("--conf_thresh",type=float, default=CONF_THRESH)
-    p.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
-    p.add_argument("--max_det",    type=int,   default=100,
-                   help="Max detections per image")
-    return p.parse_args()
+def imread_unicode(path: Path) -> Optional[np.ndarray]:
+    if not path.exists():
+        return None
+    arr = np.fromfile(str(path), dtype=np.uint8)
+    if arr.size == 0:
+        return None
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model loading
-# ─────────────────────────────────────────────────────────────────────────────
+def imwrite_unicode(path: Path, image_bgr: np.ndarray) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ext = path.suffix.lower() if path.suffix.lower() in VALID_EXTS else ".jpg"
+    out_path = path if path.suffix.lower() in VALID_EXTS else path.with_suffix(ext)
+    ok, enc = cv2.imencode(ext, image_bgr)
+    if not ok:
+        return False
+    enc.tofile(str(out_path))
+    return True
 
-def load_model(checkpoint_path: str, backbone: str, device: torch.device) -> AnchorFreeDetector:
-    ckpt_path = Path(checkpoint_path)
-    if not ckpt_path.exists():
-        raise FileNotFoundError(
-            f"Checkpoint not found: {ckpt_path}\n"
-            f"Run train.py first or specify --checkpoint explicitly."
+
+def letterbox_preprocess(image_bgr: np.ndarray, img_size: int) -> Tuple[torch.Tensor, LetterboxMeta]:
+    h, w = image_bgr.shape[:2]
+    scale = min(float(img_size) / max(w, 1), float(img_size) / max(h, 1))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    canvas = np.full((img_size, img_size, 3), 114, dtype=np.uint8)
+    dx = (img_size - new_w) // 2
+    dy = (img_size - new_h) // 2
+    canvas[dy : dy + new_h, dx : dx + new_w] = resized
+
+    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    rgb = (rgb - np.array(MEAN, dtype=np.float32)) / np.array(STD, dtype=np.float32)
+    tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+
+    meta = LetterboxMeta(scale=scale, dx=float(dx), dy=float(dy), orig_w=int(w), orig_h=int(h))
+    return tensor, meta
+
+
+def collect_images(image_dir: Path) -> List[Path]:
+    imgs = [p for p in sorted(image_dir.iterdir()) if p.is_file() and p.suffix.lower() in VALID_EXTS]
+    return imgs
+
+
+def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: Sequence[str]) -> np.ndarray:
+    out = image_bgr.copy()
+    cls_to_idx = {c: i for i, c in enumerate(class_names)}
+
+    for obj in boxes:
+        cls_name = str(obj["class"])
+        score = float(obj["confidence"])
+        x1, y1, x2, y2 = [int(round(v)) for v in obj["bbox"]]
+        idx = cls_to_idx.get(cls_name, 0)
+        color = (
+            int((53 * (idx + 1)) % 255),
+            int((97 * (idx + 1)) % 255),
+            int((193 * (idx + 1)) % 255),
         )
-
-    ckpt = torch.load(ckpt_path, map_location=device)
-
-    # Checkpoint may contain 'config' dict from train.py
-    if "config" in ckpt:
-        cfg = ckpt["config"]
-        backbone    = cfg.get("backbone", backbone)
-        num_classes = cfg.get("num_classes", NUM_CLASSES)
-    else:
-        num_classes = NUM_CLASSES
-
-    model = AnchorFreeDetector(
-        num_classes=num_classes,
-        backbone_name=backbone,
-        pretrained=False,   # weights come from checkpoint
-    ).to(device)
-
-    state = ckpt.get("model", ckpt)   # support bare state-dict saves
-    model.load_state_dict(state)
-    model.eval()
-
-    epoch    = ckpt.get("epoch", "?")
-    best_map = ckpt.get("best_map", "?")
-    print(f"Loaded checkpoint: {ckpt_path}  (epoch={epoch}, best_mAP={best_map})")
-    return model
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Inference loop
-# ─────────────────────────────────────────────────────────────────────────────
-
-def collect_image_paths(image_dir: str) -> List[Path]:
-    folder = Path(image_dir)
-    if not folder.exists():
-        raise FileNotFoundError(f"Image directory not found: {image_dir}")
-    paths = sorted(
-        p for p in folder.iterdir()
-        if p.is_file() and p.suffix.lower() in VALID_IMAGE_EXTS
-    )
-    return paths
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        label = f"{cls_name}:{score:.2f}"
+        cv2.putText(out, label, (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    return out
 
 
 @torch.no_grad()
@@ -127,88 +86,149 @@ def run_inference(
     model: AnchorFreeDetector,
     image_paths: List[Path],
     device: torch.device,
+    batch_size: int,
     img_size: int,
     conf_thresh: float,
     nms_thresh: float,
-    max_det: int,
-) -> List[Dict[str, Any]]:
-    results: List[Dict[str, Any]] = []
-    n = len(image_paths)
+    class_names: Sequence[str],
+) -> List[dict]:
+    results: List[dict] = []
+    amp_enabled = device.type == "cuda"
 
-    for i, path in enumerate(image_paths):
-        image_id = path.name
-        try:
-            dets = predict_single_image(
-                model=model,
-                image_path=path,
-                device=device,
-                img_size=img_size,
-                stride=float(FEATURE_STRIDE),
-                conf_thresh=conf_thresh,
-                nms_iou_thresh=nms_thresh,
-                class_names=CLASS_NAMES,
-                max_detections=max_det,
-            )
-            # Round coordinates to 2 decimal places
-            for d in dets:
-                d["bbox"]       = [round(float(v), 2) for v in d["bbox"]]
-                d["confidence"] = round(float(d["confidence"]), 4)
-        except Exception as exc:
-            print(f"[WARN] Failed {image_id}: {exc}")
-            dets = []
+    for start in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[start : start + batch_size]
+        tensors: List[torch.Tensor] = []
+        metas: List[LetterboxMeta] = []
+        image_ids: List[str] = []
 
-        results.append({"image_id": image_id, "boxes": dets})
+        for p in batch_paths:
+            image = imread_unicode(p)
+            if image is None:
+                continue
+            tensor, meta = letterbox_preprocess(image, img_size=img_size)
+            tensors.append(tensor)
+            metas.append(meta)
+            image_ids.append(p.name)
 
-        if (i + 1) % 50 == 0 or (i + 1) == n:
-            print(f"  Processed {i+1}/{n} images …")
+        if not tensors:
+            continue
+
+        images = torch.stack(tensors, dim=0).to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+            outputs = model(images)
+
+        batch_results = postprocess_batch(
+            outputs=outputs,
+            image_ids=image_ids,
+            metas=metas,
+            class_names=class_names,
+            num_classes=len(class_names),
+            img_size=img_size,
+            conf_thresh=conf_thresh,
+            nms_thresh=nms_thresh,
+            reg_decode="auto",
+            center_combine="mul",
+            min_box_size=2.0,
+        )
+        results.extend(batch_results)
 
     return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
+def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: Path, limit: int, class_names: Sequence[str]) -> int:
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+
+    for pred in predictions[:limit]:
+        image_id = pred["image_id"]
+        img_path = image_dir / image_id
+        image = imread_unicode(img_path)
+        if image is None:
+            continue
+
+        vis = draw_prediction(image, pred.get("boxes", []), class_names=class_names)
+        out_path = preview_dir / image_id
+        if imwrite_unicode(out_path, vis):
+            saved += 1
+    return saved
+
+
+def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[AnchorFreeDetector, List[str], int]:
+    ckpt = torch.load(str(checkpoint_path), map_location=device)
+    classes = ckpt.get("classes", CLASS_NAMES)
+    img_size = int(ckpt.get("img_size", IMG_SIZE))
+    num_classes = len(classes)
+
+    model = AnchorFreeDetector(num_classes=num_classes, pretrained=False).to(device)
+    state = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    return model, list(classes), img_size
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Predict with anchor-free detector and export JSON.")
+    parser.add_argument("--image_dir", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=Path("predictions.json"))
+    parser.add_argument("--checkpoint", type=Path, default=Path("models/best.pth"))
+    parser.add_argument("--img_size", type=int, default=IMG_SIZE)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
+    parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
+    parser.add_argument("--preview_dir", type=Path, default=Path("results"))
+    parser.add_argument("--preview_count", type=int, default=50)
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    return parser.parse_args()
+
 
 def main() -> None:
     args = parse_args()
+    if not args.checkpoint.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    if not args.image_dir.exists():
+        raise FileNotFoundError(f"Image directory not found: {args.image_dir}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
-    # Load model
-    model = load_model(args.checkpoint, args.backbone, device)
+    model, ckpt_classes, ckpt_img_size = load_checkpoint_model(args.checkpoint, device=device)
+    class_names = ckpt_classes if ckpt_classes else CLASS_NAMES
+    img_size = args.img_size if args.img_size > 0 else ckpt_img_size
 
-    # Collect images
-    image_paths = collect_image_paths(args.image_dir)
-    print(f"Found {len(image_paths)} images in {args.image_dir}")
+    image_paths = collect_images(args.image_dir)
+    if not image_paths:
+        raise ValueError(f"No images found in: {args.image_dir}")
 
-    if len(image_paths) == 0:
-        print("No images found – writing empty predictions file.")
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump([], f, indent=2)
-        return
-
-    # Run inference
-    print("Running inference …")
-    results = run_inference(
+    predictions = run_inference(
         model=model,
         image_paths=image_paths,
         device=device,
-        img_size=args.img_size,
-        conf_thresh=args.conf_thresh,
-        nms_thresh=args.nms_thresh,
-        max_det=args.max_det,
+        batch_size=max(1, args.batch_size),
+        img_size=img_size,
+        conf_thresh=float(args.conf_thresh),
+        nms_thresh=float(args.nms_thresh),
+        class_names=class_names,
     )
 
-    # Save results
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w", encoding="utf-8") as f:
+        json.dump(predictions, f, ensure_ascii=False, indent=2)
 
-    total_boxes = sum(len(r["boxes"]) for r in results)
-    print(f"\nDone.  {len(results)} images  |  {total_boxes} total detections")
-    print(f"Predictions saved → {out_path.resolve()}")
+    saved = save_preview_images(
+        predictions=predictions,
+        image_dir=args.image_dir,
+        preview_dir=args.preview_dir,
+        limit=max(0, args.preview_count),
+        class_names=class_names,
+    )
+
+    print(f"Device: {device}")
+    print(f"Predicted images: {len(predictions)}")
+    print(f"Saved JSON: {args.output}")
+    print(f"Saved preview images: {saved} -> {args.preview_dir}")
 
 
 if __name__ == "__main__":
