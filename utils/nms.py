@@ -35,9 +35,7 @@ try:
         IMG_SIZE,
         NMS_IOU_THRESH,
         NUM_CLASSES,
-        PERSON_CLASS_NAME,
-        PERSON_CONF_THRESH,
-        PERSON_NMS_IOU_THRESH,
+        SAME_CLASS_CONTAIN_THRESH,
         STRIDES,
     )
 except Exception:
@@ -48,9 +46,7 @@ except Exception:
     AGNOSTIC_NMS_IOU_THRESH = 0.75
     CROSS_CLASS_IOU_THRESH = 0.85
     CROSS_CLASS_CONTAIN_THRESH = 0.9
-    PERSON_CLASS_NAME = "person"
-    PERSON_CONF_THRESH = 0.45
-    PERSON_NMS_IOU_THRESH = 0.27
+    SAME_CLASS_CONTAIN_THRESH = 0.82
     IMG_SIZE = 320
     NUM_CLASSES = 5
     STRIDES = [16, 32]
@@ -322,27 +318,6 @@ def decode_multilevel(
     )
 
 
-def apply_per_class_conf_threshold(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    class_ids: torch.Tensor,
-    class_conf_thresholds: Optional[Dict[int, float]] = None,
-    default_conf: float = CONF_THRESH,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if boxes.numel() == 0:
-        return boxes, scores, class_ids
-    if not class_conf_thresholds:
-        return boxes, scores, class_ids
-
-    keep_mask = torch.zeros_like(scores, dtype=torch.bool)
-    for i in range(scores.numel()):
-        cls = int(class_ids[i].item())
-        thr = float(class_conf_thresholds.get(cls, default_conf))
-        keep_mask[i] = scores[i] > thr
-
-    return boxes[keep_mask], scores[keep_mask], class_ids[keep_mask]
-
-
 def _box_iou_xyxy(one: torch.Tensor, many: torch.Tensor) -> torch.Tensor:
     """IoU between one box (4,) and many boxes (N,4)."""
     xx1 = torch.maximum(one[0], many[:, 0])
@@ -410,7 +385,6 @@ def class_wise_nms(
     scores: torch.Tensor,
     class_ids: torch.Tensor,
     nms_thresh: float = NMS_IOU_THRESH,
-    per_class_nms_thresh: Optional[Dict[int, float]] = None,
 ) -> torch.Tensor:
     """
     Apply NMS independently for each class id.
@@ -429,8 +403,7 @@ def class_wise_nms(
         if idx.numel() == 0:
             continue
 
-        cls_thr = float(per_class_nms_thresh.get(int(cls.item()), nms_thresh)) if per_class_nms_thresh else float(nms_thresh)
-        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=cls_thr)
+        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=float(nms_thresh))
         keep_global.append(idx[cls_keep_rel])
 
     if not keep_global:
@@ -479,6 +452,41 @@ def suppress_cross_class_duplicates(
                 iou = _box_iou_xyxy(cand_box, cross_boxes)
                 ios = _intersection_over_small(cand_box, cross_boxes)
                 if torch.any((iou > float(iou_thresh)) | (ios > float(contain_thresh))):
+                    drop = True
+        if not drop:
+            keep.append(idx)
+
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
+
+def suppress_same_class_containment(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    class_ids: torch.Tensor,
+    contain_thresh: float,
+) -> torch.Tensor:
+    """
+    Remove lower-score duplicates of the same class when one box is almost contained in another.
+    """
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+
+    order = torch.argsort(scores, descending=True)
+    keep: List[int] = []
+
+    for idx in order.tolist():
+        cand_box = boxes[idx]
+        cand_cls = class_ids[idx]
+        drop = False
+        if keep:
+            kept_idx = torch.tensor(keep, dtype=torch.long, device=boxes.device)
+            kept_boxes = boxes[kept_idx]
+            kept_cls = class_ids[kept_idx]
+            same_cls = kept_cls == cand_cls
+            if torch.any(same_cls):
+                same_boxes = kept_boxes[same_cls]
+                ios = _intersection_over_small(cand_box, same_boxes)
+                if torch.any(ios > float(contain_thresh)):
                     drop = True
         if not drop:
             keep.append(idx)
@@ -536,10 +544,9 @@ def postprocess_single_image(
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
     agnostic_nms_thresh: float = AGNOSTIC_NMS_IOU_THRESH,
+    same_class_contain_thresh: float = SAME_CLASS_CONTAIN_THRESH,
     cross_class_iou_thresh: float = CROSS_CLASS_IOU_THRESH,
     cross_class_contain_thresh: float = CROSS_CLASS_CONTAIN_THRESH,
-    class_conf_thresholds: Optional[Dict[int, float]] = None,
-    per_class_nms_thresh: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     """
     Full decode + NMS + remap pipeline for one image.
@@ -571,22 +578,11 @@ def postprocess_single_image(
     if boxes.numel() == 0:
         return {"image_id": image_id, "boxes": []}
 
-    boxes, scores, cls_ids = apply_per_class_conf_threshold(
-        boxes=boxes,
-        scores=scores,
-        class_ids=cls_ids,
-        class_conf_thresholds=class_conf_thresholds,
-        default_conf=conf_thresh,
-    )
-    if boxes.numel() == 0:
-        return {"image_id": image_id, "boxes": []}
-
     keep = class_wise_nms(
         boxes=boxes,
         scores=scores,
         class_ids=cls_ids,
         nms_thresh=nms_thresh,
-        per_class_nms_thresh=per_class_nms_thresh,
     )
 
     boxes = boxes[keep]
@@ -595,6 +591,17 @@ def postprocess_single_image(
 
     if agnostic_nms_thresh > 0:
         keep = class_agnostic_nms(boxes=boxes, scores=scores, iou_thresh=agnostic_nms_thresh)
+        boxes = boxes[keep]
+        scores = scores[keep]
+        cls_ids = cls_ids[keep]
+
+    if same_class_contain_thresh > 0:
+        keep = suppress_same_class_containment(
+            boxes=boxes,
+            scores=scores,
+            class_ids=cls_ids,
+            contain_thresh=max(0.0, same_class_contain_thresh),
+        )
         boxes = boxes[keep]
         scores = scores[keep]
         cls_ids = cls_ids[keep]
@@ -652,10 +659,9 @@ def postprocess_batch(
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
     agnostic_nms_thresh: float = AGNOSTIC_NMS_IOU_THRESH,
+    same_class_contain_thresh: float = SAME_CLASS_CONTAIN_THRESH,
     cross_class_iou_thresh: float = CROSS_CLASS_IOU_THRESH,
     cross_class_contain_thresh: float = CROSS_CLASS_CONTAIN_THRESH,
-    class_conf_thresholds: Optional[Dict[int, float]] = None,
-    per_class_nms_thresh: Optional[Dict[int, float]] = None,
 ) -> List[Dict[str, Any]]:
     """Batch wrapper for JSON-ready predictions."""
     bsz = outputs["cls_logits"][0].shape[0]
@@ -685,10 +691,9 @@ def postprocess_batch(
                 background_index=background_index,
                 min_box_size=min_box_size,
                 agnostic_nms_thresh=agnostic_nms_thresh,
+                same_class_contain_thresh=same_class_contain_thresh,
                 cross_class_iou_thresh=cross_class_iou_thresh,
                 cross_class_contain_thresh=cross_class_contain_thresh,
-                class_conf_thresholds=class_conf_thresholds,
-                per_class_nms_thresh=per_class_nms_thresh,
             )
         )
     return results
