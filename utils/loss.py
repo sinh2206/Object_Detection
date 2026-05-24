@@ -31,6 +31,7 @@ try:
         LAMBDA_CLS,
         LAMBDA_CTR,
         LAMBDA_REG,
+        LABEL_SMOOTHING,
         NUM_CLASSES,
         STRIDES,
     )
@@ -43,6 +44,7 @@ except Exception:
     LAMBDA_CLS = 1.0
     LAMBDA_REG = 1.0
     LAMBDA_CTR = 0.5
+    LABEL_SMOOTHING = 0.05
 
 EPS = 1e-8
 DEFAULT_CENTER_RADIUS = 1.5
@@ -149,9 +151,12 @@ def focal_sigmoid_loss(
     targets: torch.Tensor,
     alpha: float = FOCAL_ALPHA,
     gamma: float = FOCAL_GAMMA,
+    label_smoothing: float = 0.0,
     reduction: str = "mean",
 ) -> torch.Tensor:
     """Sigmoid focal loss for multi-label classification."""
+    if label_smoothing > 0:
+        targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
     prob = torch.sigmoid(logits)
     ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
@@ -556,6 +561,7 @@ def compute_loss(
     lambda_ctr: float = LAMBDA_CTR,
     focal_alpha: float = FOCAL_ALPHA,
     focal_gamma: float = FOCAL_GAMMA,
+    label_smoothing: float = LABEL_SMOOTHING,
     center_radius: float = DEFAULT_CENTER_RADIUS,
     use_scale_ranges: bool = True,
 ) -> Dict[str, torch.Tensor]:
@@ -620,6 +626,7 @@ def compute_loss(
                 targets=cls_tgt,
                 alpha=focal_alpha,
                 gamma=focal_gamma,
+                label_smoothing=label_smoothing,
                 reduction="sum",
             )
         total_cls = total_cls + cls_loss
@@ -689,6 +696,7 @@ class DetectionLoss(nn.Module):
         lambda_ctr: float = LAMBDA_CTR,
         focal_alpha: float = FOCAL_ALPHA,
         focal_gamma: float = FOCAL_GAMMA,
+        label_smoothing: float = LABEL_SMOOTHING,
         center_radius: float = DEFAULT_CENTER_RADIUS,
         use_scale_ranges: bool = True,
     ):
@@ -700,6 +708,7 @@ class DetectionLoss(nn.Module):
         self.lambda_ctr = float(lambda_ctr)
         self.focal_alpha = float(focal_alpha)
         self.focal_gamma = float(focal_gamma)
+        self.label_smoothing = float(label_smoothing)
         self.center_radius = float(center_radius)
         self.use_scale_ranges = bool(use_scale_ranges)
 
@@ -714,6 +723,7 @@ class DetectionLoss(nn.Module):
             lambda_ctr=self.lambda_ctr,
             focal_alpha=self.focal_alpha,
             focal_gamma=self.focal_gamma,
+            label_smoothing=self.label_smoothing,
             center_radius=self.center_radius,
             use_scale_ranges=self.use_scale_ranges,
         )

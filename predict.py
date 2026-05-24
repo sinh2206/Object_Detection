@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -61,6 +62,37 @@ def collect_images(image_dir: Path) -> List[Path]:
     return imgs
 
 
+def load_annotation(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def select_topk_images_by_objects(annotation_path: Path, image_dir: Path, top_k: int) -> List[Path]:
+    data = load_annotation(annotation_path)
+    images = data.get("images", [])
+    annotations = data.get("annotations", [])
+
+    count_by_image: Dict[str, int] = defaultdict(int)
+    for ann in annotations:
+        image_id = str(ann.get("image_id", ""))
+        if image_id:
+            count_by_image[image_id] += 1
+
+    rows: List[Tuple[int, str, Path]] = []
+    for im in images:
+        image_id = str(im.get("id", ""))
+        file_name = Path(str(im.get("file_name", image_id))).name
+        count = int(count_by_image.get(image_id, 0))
+        p = image_dir / file_name
+        if not p.exists():
+            p = image_dir / image_id
+        if p.exists() and p.suffix.lower() in VALID_EXTS:
+            rows.append((count, image_id, p))
+
+    rows.sort(key=lambda x: (-x[0], x[1]))
+    return [x[2] for x in rows[: max(0, top_k)]]
+
+
 def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: Sequence[str]) -> np.ndarray:
     out = image_bgr.copy()
     cls_to_idx = {c: i for i, c in enumerate(class_names)}
@@ -91,6 +123,9 @@ def run_inference(
     conf_thresh: float,
     nms_thresh: float,
     class_names: Sequence[str],
+    agnostic_nms_thresh: float,
+    cross_class_iou_thresh: float,
+    cross_class_contain_thresh: float,
 ) -> List[dict]:
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
@@ -129,19 +164,30 @@ def run_inference(
             reg_decode="auto",
             center_combine="mul",
             min_box_size=2.0,
+            agnostic_nms_thresh=agnostic_nms_thresh,
+            cross_class_iou_thresh=cross_class_iou_thresh,
+            cross_class_contain_thresh=cross_class_contain_thresh,
         )
         results.extend(batch_results)
 
     return results
 
 
-def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: Path, limit: int, class_names: Sequence[str]) -> int:
+def save_preview_images(
+    predictions: List[dict],
+    image_path_map: Dict[str, Path],
+    preview_dir: Path,
+    limit: int,
+    class_names: Sequence[str],
+) -> int:
     preview_dir.mkdir(parents=True, exist_ok=True)
     saved = 0
 
     for pred in predictions[:limit]:
         image_id = pred["image_id"]
-        img_path = image_dir / image_id
+        img_path = image_path_map.get(image_id)
+        if img_path is None:
+            continue
         image = imread_unicode(img_path)
         if image is None:
             continue
@@ -169,7 +215,7 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Predict with anchor-free detector and export JSON.")
-    parser.add_argument("--image_dir", type=Path, required=True)
+    parser.add_argument("--image_dir", type=Path, default=None, help="Predict all images in this folder.")
     parser.add_argument("--output", type=Path, default=Path("predictions.json"))
     parser.add_argument(
         "--checkpoint",
@@ -183,8 +229,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
+    parser.add_argument("--agnostic_nms_thresh", type=float, default=0.75)
+    parser.add_argument("--cross_class_iou_thresh", type=float, default=0.85)
+    parser.add_argument("--cross_class_contain_thresh", type=float, default=0.9)
     parser.add_argument("--preview_dir", type=Path, default=Path("results"))
     parser.add_argument("--preview_count", type=int, default=50)
+    parser.add_argument(
+        "--top_k_objects",
+        type=int,
+        default=0,
+        help="If >0, select top-K images with most objects from train/val annotations (split ~50/50).",
+    )
+    parser.add_argument("--train_data", type=Path, default=Path("public/annotations/train.json"))
+    parser.add_argument("--val_data", type=Path, default=Path("public/annotations/val.json"))
+    parser.add_argument("--train_image_dir", type=Path, default=Path("public/train/images"))
+    parser.add_argument("--val_image_dir", type=Path, default=Path("public/val/images"))
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
@@ -193,8 +252,6 @@ def main() -> None:
     args = parse_args()
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
-    if not args.image_dir.exists():
-        raise FileNotFoundError(f"Image directory not found: {args.image_dir}")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -205,9 +262,34 @@ def main() -> None:
     class_names = ckpt_classes if ckpt_classes else CLASS_NAMES
     img_size = args.img_size if args.img_size > 0 else ckpt_img_size
 
-    image_paths = collect_images(args.image_dir)
+    image_paths: List[Path] = []
+    if int(args.top_k_objects) > 0:
+        if not args.train_data.exists() or not args.val_data.exists():
+            raise FileNotFoundError("When --top_k_objects > 0, --train_data and --val_data must exist.")
+        if not args.train_image_dir.exists() or not args.val_image_dir.exists():
+            raise FileNotFoundError("When --top_k_objects > 0, --train_image_dir and --val_image_dir must exist.")
+
+        top_k = int(args.top_k_objects)
+        top_k_train = top_k // 2
+        top_k_val = top_k - top_k_train
+        train_paths = select_topk_images_by_objects(args.train_data, args.train_image_dir, top_k=top_k_train)
+        val_paths = select_topk_images_by_objects(args.val_data, args.val_image_dir, top_k=top_k_val)
+        image_paths = train_paths + val_paths
+    else:
+        if args.image_dir is None:
+            raise ValueError("Please provide --image_dir, or set --top_k_objects > 0.")
+        if not args.image_dir.exists():
+            raise FileNotFoundError(f"Image directory not found: {args.image_dir}")
+        image_paths = collect_images(args.image_dir)
+
     if not image_paths:
-        raise ValueError(f"No images found in: {args.image_dir}")
+        raise ValueError("No images selected for inference.")
+
+    # Keep unique image names while preserving first occurrence.
+    unique_by_name: Dict[str, Path] = {}
+    for p in image_paths:
+        unique_by_name.setdefault(p.name, p)
+    image_paths = list(unique_by_name.values())
 
     predictions = run_inference(
         model=model,
@@ -218,15 +300,19 @@ def main() -> None:
         conf_thresh=float(args.conf_thresh),
         nms_thresh=float(args.nms_thresh),
         class_names=class_names,
+        agnostic_nms_thresh=float(args.agnostic_nms_thresh),
+        cross_class_iou_thresh=float(args.cross_class_iou_thresh),
+        cross_class_contain_thresh=float(args.cross_class_contain_thresh),
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as f:
         json.dump(predictions, f, ensure_ascii=False, indent=2)
 
+    image_path_map = {p.name: p for p in image_paths}
     saved = save_preview_images(
         predictions=predictions,
-        image_dir=args.image_dir,
+        image_path_map=image_path_map,
         preview_dir=args.preview_dir,
         limit=max(0, args.preview_count),
         class_names=class_names,

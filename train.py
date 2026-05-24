@@ -383,6 +383,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
+    parser.add_argument("--center_radius", type=float, default=1.5)
+    parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     return parser.parse_args()
 
@@ -406,7 +409,13 @@ def main() -> None:
     val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device)
-    criterion = DetectionLoss(num_classes=num_classes, strides=STRIDES).to(device)
+    criterion = DetectionLoss(
+        num_classes=num_classes,
+        strides=STRIDES,
+        label_smoothing=float(args.label_smoothing),
+        center_radius=float(args.center_radius),
+        use_scale_ranges=not args.no_scale_ranges,
+    ).to(device)
     optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
