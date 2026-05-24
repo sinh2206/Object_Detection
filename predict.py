@@ -10,7 +10,18 @@ import cv2
 import numpy as np
 import torch
 
-from utils.config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, MEAN, NMS_IOU_THRESH, NUM_CLASSES, STD
+from utils.config import (
+    CLASS_NAMES,
+    CONF_THRESH,
+    IMG_SIZE,
+    MEAN,
+    NMS_IOU_THRESH,
+    NUM_CLASSES,
+    PERSON_CLASS_NAME,
+    PERSON_CONF_THRESH,
+    PERSON_NMS_IOU_THRESH,
+    STD,
+)
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
 
@@ -149,14 +160,15 @@ def compute_image_error(
     pred_boxes: List[dict],
     gt_boxes: List[dict],
     iou_thr: float = 0.5,
+    class_error_weight: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     pred = sorted(pred_boxes, key=lambda x: float(x.get("confidence", 0.0)), reverse=True)
     gt_used = [False] * len(gt_boxes)
 
-    tp = 0
-    fp = 0
+    tp = 0.0
+    fp = 0.0
     loc_pen = 0.0
-    cls_miss = 0
+    cls_miss = 0.0
 
     for p in pred:
         p_cls = str(p.get("class", ""))
@@ -173,31 +185,37 @@ def compute_image_error(
                 best_idx = i
 
         if best_idx < 0:
-            fp += 1
+            fp += 1.0
             continue
 
         g_cls = str(gt_boxes[best_idx].get("class", ""))
+        w = float(class_error_weight.get(g_cls, 1.0)) if class_error_weight else 1.0
         if best_iou >= iou_thr and p_cls == g_cls:
             gt_used[best_idx] = True
-            tp += 1
-            loc_pen += max(0.0, 1.0 - best_iou)
+            tp += 1.0
+            loc_pen += w * max(0.0, 1.0 - best_iou)
         elif best_iou >= iou_thr and p_cls != g_cls:
             # strong overlap but wrong class: count as heavy mistake
             gt_used[best_idx] = True
-            fp += 1
-            cls_miss += 1
+            fp += w
+            cls_miss += w
         else:
-            fp += 1
+            fp += w
 
-    fn = sum(1 for x in gt_used if not x)
+    fn = 0.0
+    for i, used in enumerate(gt_used):
+        if not used:
+            g_cls = str(gt_boxes[i].get("class", ""))
+            w = float(class_error_weight.get(g_cls, 1.0)) if class_error_weight else 1.0
+            fn += w
     denom = max(1.0, float(len(gt_boxes)))
     err = (fp + fn + 0.5 * loc_pen + 1.5 * cls_miss) / denom
     return {
         "error_score": float(err),
-        "tp": float(tp),
-        "fp": float(fp),
-        "fn": float(fn),
-        "cls_miss": float(cls_miss),
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "cls_miss": cls_miss,
     }
 
 
@@ -206,12 +224,18 @@ def select_worst_predictions(
     gt_map: Dict[str, List[dict]],
     top_k: int,
     iou_thr: float = 0.5,
+    class_error_weight: Optional[Dict[str, float]] = None,
 ) -> List[dict]:
     rows: List[Tuple[float, dict]] = []
     for pred in predictions:
         image_id = str(pred.get("image_id", ""))
         gt_boxes = gt_map.get(image_id, [])
-        stat = compute_image_error(pred.get("boxes", []), gt_boxes, iou_thr=iou_thr)
+        stat = compute_image_error(
+            pred.get("boxes", []),
+            gt_boxes,
+            iou_thr=iou_thr,
+            class_error_weight=class_error_weight,
+        )
         item = dict(pred)
         item["error"] = stat
         rows.append((float(stat["error_score"]), item))
@@ -269,6 +293,8 @@ def run_inference(
     agnostic_nms_thresh: float,
     cross_class_iou_thresh: float,
     cross_class_contain_thresh: float,
+    class_conf_thresholds: Optional[Dict[int, float]] = None,
+    per_class_nms_thresh: Optional[Dict[int, float]] = None,
 ) -> List[dict]:
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
@@ -310,6 +336,8 @@ def run_inference(
             agnostic_nms_thresh=agnostic_nms_thresh,
             cross_class_iou_thresh=cross_class_iou_thresh,
             cross_class_contain_thresh=cross_class_contain_thresh,
+            class_conf_thresholds=class_conf_thresholds,
+            per_class_nms_thresh=per_class_nms_thresh,
         )
         results.extend(batch_results)
 
@@ -382,6 +410,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agnostic_nms_thresh", type=float, default=0.75)
     parser.add_argument("--cross_class_iou_thresh", type=float, default=0.85)
     parser.add_argument("--cross_class_contain_thresh", type=float, default=0.9)
+    parser.add_argument("--person_conf_thresh", type=float, default=PERSON_CONF_THRESH)
+    parser.add_argument("--person_nms_thresh", type=float, default=PERSON_NMS_IOU_THRESH)
     parser.add_argument("--preview_dir", type=Path, default=Path("results"))
     parser.add_argument("--preview_count", type=int, default=50)
     parser.add_argument(
@@ -391,6 +421,7 @@ def parse_args() -> argparse.Namespace:
         help="If >0, rank images by prediction-vs-GT error and export top-K worst images.",
     )
     parser.add_argument("--error_iou", type=float, default=0.5, help="IoU threshold used for error ranking.")
+    parser.add_argument("--person_error_weight", type=float, default=2.0)
     parser.add_argument(
         "--top_k_objects",
         type=int,
@@ -420,6 +451,13 @@ def main() -> None:
     model, ckpt_classes, ckpt_img_size = load_checkpoint_model(args.checkpoint, device=device)
     class_names = ckpt_classes if ckpt_classes else CLASS_NAMES
     img_size = args.img_size if args.img_size > 0 else ckpt_img_size
+    class_to_idx = {c: i for i, c in enumerate(class_names)}
+    person_idx = class_to_idx.get(PERSON_CLASS_NAME, None)
+    class_conf_thresholds: Dict[int, float] = {}
+    per_class_nms_thresh: Dict[int, float] = {}
+    if person_idx is not None:
+        class_conf_thresholds[int(person_idx)] = float(args.person_conf_thresh)
+        per_class_nms_thresh[int(person_idx)] = float(args.person_nms_thresh)
 
     image_paths: List[Path] = []
     gt_map_all: Dict[str, List[dict]] = {}
@@ -483,14 +521,18 @@ def main() -> None:
         agnostic_nms_thresh=float(args.agnostic_nms_thresh),
         cross_class_iou_thresh=float(args.cross_class_iou_thresh),
         cross_class_contain_thresh=float(args.cross_class_contain_thresh),
+        class_conf_thresholds=class_conf_thresholds,
+        per_class_nms_thresh=per_class_nms_thresh,
     )
 
     if use_error_ranking:
+        class_error_weight = {PERSON_CLASS_NAME: float(args.person_error_weight)}
         predictions = select_worst_predictions(
             predictions=predictions,
             gt_map=gt_map_all,
             top_k=int(args.error_top_k),
             iou_thr=float(args.error_iou),
+            class_error_weight=class_error_weight,
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

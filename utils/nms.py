@@ -35,6 +35,9 @@ try:
         IMG_SIZE,
         NMS_IOU_THRESH,
         NUM_CLASSES,
+        PERSON_CLASS_NAME,
+        PERSON_CONF_THRESH,
+        PERSON_NMS_IOU_THRESH,
         STRIDES,
     )
 except Exception:
@@ -45,6 +48,9 @@ except Exception:
     AGNOSTIC_NMS_IOU_THRESH = 0.75
     CROSS_CLASS_IOU_THRESH = 0.85
     CROSS_CLASS_CONTAIN_THRESH = 0.9
+    PERSON_CLASS_NAME = "person"
+    PERSON_CONF_THRESH = 0.45
+    PERSON_NMS_IOU_THRESH = 0.27
     IMG_SIZE = 320
     NUM_CLASSES = 5
     STRIDES = [16, 32]
@@ -316,6 +322,27 @@ def decode_multilevel(
     )
 
 
+def apply_per_class_conf_threshold(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    class_ids: torch.Tensor,
+    class_conf_thresholds: Optional[Dict[int, float]] = None,
+    default_conf: float = CONF_THRESH,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if boxes.numel() == 0:
+        return boxes, scores, class_ids
+    if not class_conf_thresholds:
+        return boxes, scores, class_ids
+
+    keep_mask = torch.zeros_like(scores, dtype=torch.bool)
+    for i in range(scores.numel()):
+        cls = int(class_ids[i].item())
+        thr = float(class_conf_thresholds.get(cls, default_conf))
+        keep_mask[i] = scores[i] > thr
+
+    return boxes[keep_mask], scores[keep_mask], class_ids[keep_mask]
+
+
 def _box_iou_xyxy(one: torch.Tensor, many: torch.Tensor) -> torch.Tensor:
     """IoU between one box (4,) and many boxes (N,4)."""
     xx1 = torch.maximum(one[0], many[:, 0])
@@ -383,6 +410,7 @@ def class_wise_nms(
     scores: torch.Tensor,
     class_ids: torch.Tensor,
     nms_thresh: float = NMS_IOU_THRESH,
+    per_class_nms_thresh: Optional[Dict[int, float]] = None,
 ) -> torch.Tensor:
     """
     Apply NMS independently for each class id.
@@ -401,7 +429,8 @@ def class_wise_nms(
         if idx.numel() == 0:
             continue
 
-        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=float(nms_thresh))
+        cls_thr = float(per_class_nms_thresh.get(int(cls.item()), nms_thresh)) if per_class_nms_thresh else float(nms_thresh)
+        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=cls_thr)
         keep_global.append(idx[cls_keep_rel])
 
     if not keep_global:
@@ -509,6 +538,8 @@ def postprocess_single_image(
     agnostic_nms_thresh: float = AGNOSTIC_NMS_IOU_THRESH,
     cross_class_iou_thresh: float = CROSS_CLASS_IOU_THRESH,
     cross_class_contain_thresh: float = CROSS_CLASS_CONTAIN_THRESH,
+    class_conf_thresholds: Optional[Dict[int, float]] = None,
+    per_class_nms_thresh: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     """
     Full decode + NMS + remap pipeline for one image.
@@ -540,11 +571,22 @@ def postprocess_single_image(
     if boxes.numel() == 0:
         return {"image_id": image_id, "boxes": []}
 
+    boxes, scores, cls_ids = apply_per_class_conf_threshold(
+        boxes=boxes,
+        scores=scores,
+        class_ids=cls_ids,
+        class_conf_thresholds=class_conf_thresholds,
+        default_conf=conf_thresh,
+    )
+    if boxes.numel() == 0:
+        return {"image_id": image_id, "boxes": []}
+
     keep = class_wise_nms(
         boxes=boxes,
         scores=scores,
         class_ids=cls_ids,
         nms_thresh=nms_thresh,
+        per_class_nms_thresh=per_class_nms_thresh,
     )
 
     boxes = boxes[keep]
@@ -612,6 +654,8 @@ def postprocess_batch(
     agnostic_nms_thresh: float = AGNOSTIC_NMS_IOU_THRESH,
     cross_class_iou_thresh: float = CROSS_CLASS_IOU_THRESH,
     cross_class_contain_thresh: float = CROSS_CLASS_CONTAIN_THRESH,
+    class_conf_thresholds: Optional[Dict[int, float]] = None,
+    per_class_nms_thresh: Optional[Dict[int, float]] = None,
 ) -> List[Dict[str, Any]]:
     """Batch wrapper for JSON-ready predictions."""
     bsz = outputs["cls_logits"][0].shape[0]
@@ -643,6 +687,8 @@ def postprocess_batch(
                 agnostic_nms_thresh=agnostic_nms_thresh,
                 cross_class_iou_thresh=cross_class_iou_thresh,
                 cross_class_contain_thresh=cross_class_contain_thresh,
+                class_conf_thresholds=class_conf_thresholds,
+                per_class_nms_thresh=per_class_nms_thresh,
             )
         )
     return results

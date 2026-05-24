@@ -18,7 +18,17 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from utils.config import CLASS_NAMES, IMG_SIZE, MEAN, NUM_CLASSES, STD, STRIDES
+from utils.config import (
+    CLASS_NAMES,
+    IMG_SIZE,
+    MEAN,
+    NUM_CLASSES,
+    PERSON_CLASS_NAME,
+    PERSON_MIN_CLASS_WEIGHT,
+    PERSON_WEIGHT_BOOST,
+    STD,
+    STRIDES,
+)
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
 
@@ -33,7 +43,13 @@ class Sample:
     labels: List[int]
 
 
-def compute_class_weights(samples: List[Sample], num_classes: int) -> torch.Tensor:
+def compute_class_weights(
+    samples: List[Sample],
+    num_classes: int,
+    classes: Optional[List[str]] = None,
+    person_boost: float = PERSON_WEIGHT_BOOST,
+    person_min_weight: float = PERSON_MIN_CLASS_WEIGHT,
+) -> torch.Tensor:
     counts = np.zeros((num_classes,), dtype=np.float64)
     for s in samples:
         for y in s.labels:
@@ -44,6 +60,12 @@ def compute_class_weights(samples: List[Sample], num_classes: int) -> torch.Tens
     inv = 1.0 / np.sqrt(freq + 1e-12)
     weights = inv / inv.mean()
     weights = np.clip(weights, 0.5, 4.0)
+    if classes is not None and PERSON_CLASS_NAME in classes:
+        p_idx = classes.index(PERSON_CLASS_NAME)
+        if 0 <= p_idx < len(weights):
+            weights[p_idx] = max(weights[p_idx], float(person_min_weight))
+            weights[p_idx] *= float(person_boost)
+            weights = weights / max(weights.mean(), 1e-12)
     return torch.as_tensor(weights, dtype=torch.float32)
 
 
@@ -185,7 +207,9 @@ def get_train_transforms(img_size: int) -> A.Compose:
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
-            A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.08, p=0.6),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15, hue=0.08, p=0.65),
+            A.RandomGamma(gamma_limit=(70, 150), p=0.45),
+            A.CLAHE(clip_limit=(1.5, 4.0), tile_grid_size=(8, 8), p=0.35),
             affine,
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
@@ -425,6 +449,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=0.05)
     parser.add_argument("--center_radius", type=float, default=1.5)
+    parser.add_argument("--person_weight_boost", type=float, default=PERSON_WEIGHT_BOOST)
+    parser.add_argument("--person_min_weight", type=float, default=PERSON_MIN_CLASS_WEIGHT)
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
@@ -446,7 +472,13 @@ def main() -> None:
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
     val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
-    class_weights = compute_class_weights(train_samples, num_classes=num_classes)
+    class_weights = compute_class_weights(
+        train_samples,
+        num_classes=num_classes,
+        classes=classes,
+        person_boost=float(args.person_weight_boost),
+        person_min_weight=float(args.person_min_weight),
+    )
     train_sampler = None
     if not args.no_balanced_sampling:
         sample_weights = build_sample_weights(train_samples, class_weights)
