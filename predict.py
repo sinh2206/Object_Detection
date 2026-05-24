@@ -57,27 +57,6 @@ def letterbox_preprocess(image_bgr: np.ndarray, img_size: int) -> Tuple[torch.Te
     return tensor, meta
 
 
-def enhance_dark_image(image_bgr: np.ndarray, enable: bool = True) -> np.ndarray:
-    if not enable:
-        return image_bgr
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    mean_luma = float(np.mean(gray))
-    if mean_luma >= 95.0:
-        return image_bgr
-
-    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l2 = clahe.apply(l)
-    lab2 = cv2.merge([l2, a, b])
-    out = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
-
-    gamma = 0.85
-    lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
-    out = cv2.LUT(out, lut)
-    return out
-
-
 def collect_images(image_dir: Path) -> List[Path]:
     imgs = [p for p in sorted(image_dir.iterdir()) if p.is_file() and p.suffix.lower() in VALID_EXTS]
     return imgs
@@ -290,8 +269,6 @@ def run_inference(
     agnostic_nms_thresh: float,
     cross_class_iou_thresh: float,
     cross_class_contain_thresh: float,
-    same_class_contain_thresh: float,
-    enhance_dark: bool,
 ) -> List[dict]:
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
@@ -306,7 +283,6 @@ def run_inference(
             image = imread_unicode(p)
             if image is None:
                 continue
-            image = enhance_dark_image(image, enable=enhance_dark)
             tensor, meta = letterbox_preprocess(image, img_size=img_size)
             tensors.append(tensor)
             metas.append(meta)
@@ -331,7 +307,6 @@ def run_inference(
             reg_decode="auto",
             center_combine="mul",
             min_box_size=2.0,
-            same_class_contain_thresh=same_class_contain_thresh,
             agnostic_nms_thresh=agnostic_nms_thresh,
             cross_class_iou_thresh=cross_class_iou_thresh,
             cross_class_contain_thresh=cross_class_contain_thresh,
@@ -407,8 +382,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agnostic_nms_thresh", type=float, default=0.75)
     parser.add_argument("--cross_class_iou_thresh", type=float, default=0.85)
     parser.add_argument("--cross_class_contain_thresh", type=float, default=0.9)
-    parser.add_argument("--same_class_contain_thresh", type=float, default=0.88)
-    parser.add_argument("--disable_dark_enhance", action="store_true")
     parser.add_argument("--preview_dir", type=Path, default=Path("results"))
     parser.add_argument("--preview_count", type=int, default=50)
     parser.add_argument(
@@ -510,8 +483,6 @@ def main() -> None:
         agnostic_nms_thresh=float(args.agnostic_nms_thresh),
         cross_class_iou_thresh=float(args.cross_class_iou_thresh),
         cross_class_contain_thresh=float(args.cross_class_contain_thresh),
-        same_class_contain_thresh=float(args.same_class_contain_thresh),
-        enhance_dark=(not args.disable_dark_enhance),
     )
 
     if use_error_ranking:

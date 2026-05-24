@@ -35,7 +35,6 @@ try:
         IMG_SIZE,
         NMS_IOU_THRESH,
         NUM_CLASSES,
-        SAME_CLASS_CONTAIN_THRESH,
         STRIDES,
     )
 except Exception:
@@ -46,7 +45,6 @@ except Exception:
     AGNOSTIC_NMS_IOU_THRESH = 0.75
     CROSS_CLASS_IOU_THRESH = 0.85
     CROSS_CLASS_CONTAIN_THRESH = 0.9
-    SAME_CLASS_CONTAIN_THRESH = 0.88
     IMG_SIZE = 320
     NUM_CLASSES = 5
     STRIDES = [16, 32]
@@ -353,12 +351,7 @@ def _intersection_over_small(one: torch.Tensor, many: torch.Tensor) -> torch.Ten
     return inter / denom
 
 
-def nms_single_class(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    iou_thresh: float,
-    contain_thresh: float = SAME_CLASS_CONTAIN_THRESH,
-) -> torch.Tensor:
+def nms_single_class(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
     """
     Pure PyTorch NMS for one class.
 
@@ -379,9 +372,7 @@ def nms_single_class(
 
         rest = order[1:]
         ious = _box_iou_xyxy(boxes[i], boxes[rest])
-        ios = _intersection_over_small(boxes[i], boxes[rest])
-        drop = (ious > float(iou_thresh)) | (ios > float(contain_thresh))
-        rest = rest[~drop]
+        rest = rest[ious <= float(iou_thresh)]
         order = rest
 
     return torch.tensor(keep, dtype=torch.long, device=boxes.device)
@@ -392,7 +383,6 @@ def class_wise_nms(
     scores: torch.Tensor,
     class_ids: torch.Tensor,
     nms_thresh: float = NMS_IOU_THRESH,
-    same_class_contain_thresh: float = SAME_CLASS_CONTAIN_THRESH,
 ) -> torch.Tensor:
     """
     Apply NMS independently for each class id.
@@ -411,12 +401,7 @@ def class_wise_nms(
         if idx.numel() == 0:
             continue
 
-        cls_keep_rel = nms_single_class(
-            boxes[idx],
-            scores[idx],
-            iou_thresh=float(nms_thresh),
-            contain_thresh=float(same_class_contain_thresh),
-        )
+        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=float(nms_thresh))
         keep_global.append(idx[cls_keep_rel])
 
     if not keep_global:
@@ -428,19 +413,9 @@ def class_wise_nms(
     return keep
 
 
-def class_agnostic_nms(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    iou_thresh: float,
-    contain_thresh: float = 0.98,
-) -> torch.Tensor:
+def class_agnostic_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
     """Apply one more NMS pass without class separation."""
-    return nms_single_class(
-        boxes=boxes,
-        scores=scores,
-        iou_thresh=float(iou_thresh),
-        contain_thresh=float(contain_thresh),
-    )
+    return nms_single_class(boxes=boxes, scores=scores, iou_thresh=float(iou_thresh))
 
 
 def suppress_cross_class_duplicates(
@@ -531,7 +506,6 @@ def postprocess_single_image(
     center_combine: str = "mul",
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
-    same_class_contain_thresh: float = SAME_CLASS_CONTAIN_THRESH,
     agnostic_nms_thresh: float = AGNOSTIC_NMS_IOU_THRESH,
     cross_class_iou_thresh: float = CROSS_CLASS_IOU_THRESH,
     cross_class_contain_thresh: float = CROSS_CLASS_CONTAIN_THRESH,
@@ -571,7 +545,6 @@ def postprocess_single_image(
         scores=scores,
         class_ids=cls_ids,
         nms_thresh=nms_thresh,
-        same_class_contain_thresh=same_class_contain_thresh,
     )
 
     boxes = boxes[keep]
@@ -636,7 +609,6 @@ def postprocess_batch(
     center_combine: str = "mul",
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
-    same_class_contain_thresh: float = SAME_CLASS_CONTAIN_THRESH,
     agnostic_nms_thresh: float = AGNOSTIC_NMS_IOU_THRESH,
     cross_class_iou_thresh: float = CROSS_CLASS_IOU_THRESH,
     cross_class_contain_thresh: float = CROSS_CLASS_CONTAIN_THRESH,
@@ -668,7 +640,6 @@ def postprocess_batch(
                 center_combine=center_combine,
                 background_index=background_index,
                 min_box_size=min_box_size,
-                same_class_contain_thresh=same_class_contain_thresh,
                 agnostic_nms_thresh=agnostic_nms_thresh,
                 cross_class_iou_thresh=cross_class_iou_thresh,
                 cross_class_contain_thresh=cross_class_contain_thresh,
