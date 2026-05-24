@@ -151,6 +151,7 @@ def focal_sigmoid_loss(
     targets: torch.Tensor,
     alpha: float = FOCAL_ALPHA,
     gamma: float = FOCAL_GAMMA,
+    class_weights: Optional[torch.Tensor] = None,
     label_smoothing: float = 0.0,
     reduction: str = "mean",
 ) -> torch.Tensor:
@@ -162,6 +163,9 @@ def focal_sigmoid_loss(
     p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
     alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
     loss = alpha_t * (1.0 - p_t).pow(gamma) * ce
+    if class_weights is not None:
+        cw = class_weights.to(device=logits.device, dtype=logits.dtype).view(1, -1)
+        loss = loss * cw
 
     if reduction == "sum":
         return loss.sum()
@@ -561,6 +565,7 @@ def compute_loss(
     lambda_ctr: float = LAMBDA_CTR,
     focal_alpha: float = FOCAL_ALPHA,
     focal_gamma: float = FOCAL_GAMMA,
+    class_weights: Optional[torch.Tensor] = None,
     label_smoothing: float = LABEL_SMOOTHING,
     center_radius: float = DEFAULT_CENTER_RADIUS,
     use_scale_ranges: bool = True,
@@ -626,6 +631,7 @@ def compute_loss(
                 targets=cls_tgt,
                 alpha=focal_alpha,
                 gamma=focal_gamma,
+                class_weights=class_weights,
                 label_smoothing=label_smoothing,
                 reduction="sum",
             )
@@ -696,6 +702,7 @@ class DetectionLoss(nn.Module):
         lambda_ctr: float = LAMBDA_CTR,
         focal_alpha: float = FOCAL_ALPHA,
         focal_gamma: float = FOCAL_GAMMA,
+        class_weights: Optional[torch.Tensor] = None,
         label_smoothing: float = LABEL_SMOOTHING,
         center_radius: float = DEFAULT_CENTER_RADIUS,
         use_scale_ranges: bool = True,
@@ -708,6 +715,10 @@ class DetectionLoss(nn.Module):
         self.lambda_ctr = float(lambda_ctr)
         self.focal_alpha = float(focal_alpha)
         self.focal_gamma = float(focal_gamma)
+        if class_weights is None:
+            self.register_buffer("class_weights", torch.empty(0), persistent=False)
+        else:
+            self.register_buffer("class_weights", torch.as_tensor(class_weights, dtype=torch.float32), persistent=False)
         self.label_smoothing = float(label_smoothing)
         self.center_radius = float(center_radius)
         self.use_scale_ranges = bool(use_scale_ranges)
@@ -723,6 +734,7 @@ class DetectionLoss(nn.Module):
             lambda_ctr=self.lambda_ctr,
             focal_alpha=self.focal_alpha,
             focal_gamma=self.focal_gamma,
+            class_weights=self.class_weights if self.class_weights.numel() > 0 else None,
             label_smoothing=self.label_smoothing,
             center_radius=self.center_radius,
             use_scale_ranges=self.use_scale_ranges,

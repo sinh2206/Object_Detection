@@ -93,9 +93,148 @@ def select_topk_images_by_objects(annotation_path: Path, image_dir: Path, top_k:
     return [x[2] for x in rows[: max(0, top_k)]]
 
 
-def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: Sequence[str]) -> np.ndarray:
+def build_gt_from_annotation(annotation_path: Path, image_dir: Path) -> Tuple[Dict[str, List[dict]], Dict[str, Path]]:
+    data = load_annotation(annotation_path)
+    classes = set(data.get("classes", CLASS_NAMES))
+    images = data.get("images", [])
+    annotations = data.get("annotations", [])
+
+    gt_map: Dict[str, List[dict]] = defaultdict(list)
+    path_map: Dict[str, Path] = {}
+
+    for im in images:
+        image_id = str(im.get("id", ""))
+        file_name = Path(str(im.get("file_name", image_id))).name
+        p = image_dir / file_name
+        if not p.exists():
+            p = image_dir / image_id
+        if p.exists() and p.suffix.lower() in VALID_EXTS:
+            path_map[image_id] = p
+
+    for ann in annotations:
+        image_id = str(ann.get("image_id", ""))
+        cls_name = str(ann.get("class", ""))
+        if image_id not in path_map:
+            continue
+        if cls_name not in classes:
+            continue
+        b = ann.get("bbox", [0, 0, 0, 0])
+        if len(b) != 4:
+            continue
+        x1, y1, x2, y2 = [float(v) for v in b]
+        if x2 <= x1 or y2 <= y1:
+            continue
+        gt_map[image_id].append({"class": cls_name, "bbox": [x1, y1, x2, y2]})
+
+    return gt_map, path_map
+
+
+def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in a]
+    bx1, by1, bx2, by2 = [float(v) for v in b]
+    xx1 = max(ax1, bx1)
+    yy1 = max(ay1, by1)
+    xx2 = min(ax2, bx2)
+    yy2 = min(ay2, by2)
+    iw = max(0.0, xx2 - xx1)
+    ih = max(0.0, yy2 - yy1)
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = area_a + area_b - inter + 1e-9
+    return float(inter / denom)
+
+
+def compute_image_error(
+    pred_boxes: List[dict],
+    gt_boxes: List[dict],
+    iou_thr: float = 0.5,
+) -> Dict[str, float]:
+    pred = sorted(pred_boxes, key=lambda x: float(x.get("confidence", 0.0)), reverse=True)
+    gt_used = [False] * len(gt_boxes)
+
+    tp = 0
+    fp = 0
+    loc_pen = 0.0
+    cls_miss = 0
+
+    for p in pred:
+        p_cls = str(p.get("class", ""))
+        p_box = p.get("bbox", [0, 0, 0, 0])
+
+        best_iou = 0.0
+        best_idx = -1
+        for i, g in enumerate(gt_boxes):
+            if gt_used[i]:
+                continue
+            iou = box_iou(p_box, g.get("bbox", [0, 0, 0, 0]))
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = i
+
+        if best_idx < 0:
+            fp += 1
+            continue
+
+        g_cls = str(gt_boxes[best_idx].get("class", ""))
+        if best_iou >= iou_thr and p_cls == g_cls:
+            gt_used[best_idx] = True
+            tp += 1
+            loc_pen += max(0.0, 1.0 - best_iou)
+        elif best_iou >= iou_thr and p_cls != g_cls:
+            # strong overlap but wrong class: count as heavy mistake
+            gt_used[best_idx] = True
+            fp += 1
+            cls_miss += 1
+        else:
+            fp += 1
+
+    fn = sum(1 for x in gt_used if not x)
+    denom = max(1.0, float(len(gt_boxes)))
+    err = (fp + fn + 0.5 * loc_pen + 1.5 * cls_miss) / denom
+    return {
+        "error_score": float(err),
+        "tp": float(tp),
+        "fp": float(fp),
+        "fn": float(fn),
+        "cls_miss": float(cls_miss),
+    }
+
+
+def select_worst_predictions(
+    predictions: List[dict],
+    gt_map: Dict[str, List[dict]],
+    top_k: int,
+    iou_thr: float = 0.5,
+) -> List[dict]:
+    rows: List[Tuple[float, dict]] = []
+    for pred in predictions:
+        image_id = str(pred.get("image_id", ""))
+        gt_boxes = gt_map.get(image_id, [])
+        stat = compute_image_error(pred.get("boxes", []), gt_boxes, iou_thr=iou_thr)
+        item = dict(pred)
+        item["error"] = stat
+        rows.append((float(stat["error_score"]), item))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    return [x[1] for x in rows[: max(0, top_k)]]
+
+
+def draw_prediction(
+    image_bgr: np.ndarray,
+    boxes: Sequence[dict],
+    class_names: Sequence[str],
+    gt_boxes: Optional[Sequence[dict]] = None,
+    error_info: Optional[dict] = None,
+) -> np.ndarray:
     out = image_bgr.copy()
     cls_to_idx = {c: i for i, c in enumerate(class_names)}
+
+    if gt_boxes is not None:
+        for g in gt_boxes:
+            cls_name = str(g.get("class", "gt"))
+            x1, y1, x2, y2 = [int(round(v)) for v in g.get("bbox", [0, 0, 0, 0])]
+            cv2.rectangle(out, (x1, y1), (x2, y2), (40, 220, 40), 2)
+            cv2.putText(out, f"GT:{cls_name}", (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (40, 220, 40), 1, cv2.LINE_AA)
 
     for obj in boxes:
         cls_name = str(obj["class"])
@@ -110,6 +249,10 @@ def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: S
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         label = f"{cls_name}:{score:.2f}"
         cv2.putText(out, label, (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    if error_info is not None:
+        t = f"err={error_info.get('error_score', 0):.2f} fp={int(error_info.get('fp', 0))} fn={int(error_info.get('fn', 0))} cm={int(error_info.get('cls_miss', 0))}"
+        cv2.putText(out, t, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 255), 2, cv2.LINE_AA)
     return out
 
 
@@ -179,6 +322,7 @@ def save_preview_images(
     preview_dir: Path,
     limit: int,
     class_names: Sequence[str],
+    gt_map: Optional[Dict[str, List[dict]]] = None,
 ) -> int:
     preview_dir.mkdir(parents=True, exist_ok=True)
     saved = 0
@@ -192,7 +336,13 @@ def save_preview_images(
         if image is None:
             continue
 
-        vis = draw_prediction(image, pred.get("boxes", []), class_names=class_names)
+        vis = draw_prediction(
+            image,
+            pred.get("boxes", []),
+            class_names=class_names,
+            gt_boxes=(gt_map.get(image_id, []) if gt_map is not None else None),
+            error_info=pred.get("error"),
+        )
         out_path = preview_dir / image_id
         if imwrite_unicode(out_path, vis):
             saved += 1
@@ -235,6 +385,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preview_dir", type=Path, default=Path("results"))
     parser.add_argument("--preview_count", type=int, default=50)
     parser.add_argument(
+        "--error_top_k",
+        type=int,
+        default=0,
+        help="If >0, rank images by prediction-vs-GT error and export top-K worst images.",
+    )
+    parser.add_argument("--error_iou", type=float, default=0.5, help="IoU threshold used for error ranking.")
+    parser.add_argument(
         "--top_k_objects",
         type=int,
         default=0,
@@ -252,6 +409,8 @@ def main() -> None:
     args = parse_args()
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    if args.image_dir is None and int(args.top_k_objects) <= 0 and int(args.error_top_k) <= 0:
+        args.error_top_k = 50
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -263,7 +422,26 @@ def main() -> None:
     img_size = args.img_size if args.img_size > 0 else ckpt_img_size
 
     image_paths: List[Path] = []
-    if int(args.top_k_objects) > 0:
+    gt_map_all: Dict[str, List[dict]] = {}
+    image_path_map: Dict[str, Path] = {}
+    use_error_ranking = int(args.error_top_k) > 0
+
+    if use_error_ranking:
+        if not args.train_data.exists() or not args.val_data.exists():
+            raise FileNotFoundError("When --error_top_k > 0, --train_data and --val_data must exist.")
+        if not args.train_image_dir.exists() or not args.val_image_dir.exists():
+            raise FileNotFoundError("When --error_top_k > 0, --train_image_dir and --val_image_dir must exist.")
+
+        gt_train, path_train = build_gt_from_annotation(args.train_data, args.train_image_dir)
+        gt_val, path_val = build_gt_from_annotation(args.val_data, args.val_image_dir)
+
+        gt_map_all.update(gt_train)
+        gt_map_all.update(gt_val)
+        image_path_map.update(path_train)
+        image_path_map.update(path_val)
+        image_paths = list(image_path_map.values())
+
+    elif int(args.top_k_objects) > 0:
         if not args.train_data.exists() or not args.val_data.exists():
             raise FileNotFoundError("When --top_k_objects > 0, --train_data and --val_data must exist.")
         if not args.train_image_dir.exists() or not args.val_image_dir.exists():
@@ -290,6 +468,8 @@ def main() -> None:
     for p in image_paths:
         unique_by_name.setdefault(p.name, p)
     image_paths = list(unique_by_name.values())
+    if not image_path_map:
+        image_path_map = dict(unique_by_name)
 
     predictions = run_inference(
         model=model,
@@ -305,17 +485,25 @@ def main() -> None:
         cross_class_contain_thresh=float(args.cross_class_contain_thresh),
     )
 
+    if use_error_ranking:
+        predictions = select_worst_predictions(
+            predictions=predictions,
+            gt_map=gt_map_all,
+            top_k=int(args.error_top_k),
+            iou_thr=float(args.error_iou),
+        )
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as f:
         json.dump(predictions, f, ensure_ascii=False, indent=2)
 
-    image_path_map = {p.name: p for p in image_paths}
     saved = save_preview_images(
         predictions=predictions,
         image_path_map=image_path_map,
         preview_dir=args.preview_dir,
-        limit=max(0, args.preview_count),
+        limit=max(0, int(args.error_top_k) if use_error_ranking else args.preview_count),
         class_names=class_names,
+        gt_map=gt_map_all if use_error_ranking else None,
     )
 
     print(f"Device: {device}")

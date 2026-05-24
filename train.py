@@ -16,7 +16,7 @@ from albumentations.pytorch import ToTensorV2
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from utils.config import CLASS_NAMES, IMG_SIZE, MEAN, NUM_CLASSES, STD, STRIDES
 from utils.loss import DetectionLoss
@@ -31,6 +31,39 @@ class Sample:
     image_path: Path
     boxes: List[List[float]]
     labels: List[int]
+
+
+def compute_class_weights(samples: List[Sample], num_classes: int) -> torch.Tensor:
+    counts = np.zeros((num_classes,), dtype=np.float64)
+    for s in samples:
+        for y in s.labels:
+            if 0 <= int(y) < num_classes:
+                counts[int(y)] += 1.0
+    counts = np.maximum(counts, 1.0)
+    freq = counts / counts.sum()
+    inv = 1.0 / np.sqrt(freq + 1e-12)
+    weights = inv / inv.mean()
+    weights = np.clip(weights, 0.5, 4.0)
+    return torch.as_tensor(weights, dtype=torch.float32)
+
+
+def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> torch.Tensor:
+    cw = class_weights.cpu().numpy().astype(np.float64)
+    ws = np.ones((len(samples),), dtype=np.float64)
+    for i, s in enumerate(samples):
+        if len(s.labels) == 0:
+            ws[i] = 1.0
+            continue
+        uniq = np.unique(np.asarray(s.labels, dtype=np.int64))
+        uniq = uniq[(uniq >= 0) & (uniq < len(cw))]
+        if uniq.size == 0:
+            ws[i] = 1.0
+            continue
+        # Emphasize images containing rare classes.
+        ws[i] = float(np.max(cw[uniq]))
+    ws = ws / max(ws.mean(), 1e-12)
+    ws = np.clip(ws, 0.2, 6.0)
+    return torch.as_tensor(ws, dtype=torch.double)
 
 
 def seed_everything(seed: int) -> None:
@@ -242,11 +275,18 @@ def move_targets_to_device(targets: List[dict], device: torch.device) -> List[di
     return out
 
 
-def make_dataloader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int) -> DataLoader:
+def make_dataloader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    sampler: Optional[WeightedRandomSampler] = None,
+) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=(shuffle and sampler is None),
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=(num_workers > 0),
@@ -386,6 +426,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label_smoothing", type=float, default=0.05)
     parser.add_argument("--center_radius", type=float, default=1.5)
     parser.add_argument("--no_scale_ranges", action="store_true")
+    parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     return parser.parse_args()
 
@@ -405,13 +446,30 @@ def main() -> None:
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
     val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
-    train_loader = make_dataloader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    class_weights = compute_class_weights(train_samples, num_classes=num_classes)
+    train_sampler = None
+    if not args.no_balanced_sampling:
+        sample_weights = build_sample_weights(train_samples, class_weights)
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
+    train_loader = make_dataloader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        sampler=train_sampler,
+    )
     val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device)
     criterion = DetectionLoss(
         num_classes=num_classes,
         strides=STRIDES,
+        class_weights=class_weights,
         label_smoothing=float(args.label_smoothing),
         center_radius=float(args.center_radius),
         use_scale_ranges=not args.no_scale_ranges,
@@ -438,6 +496,7 @@ def main() -> None:
 
     print(f"Device: {device}, AMP: {amp_enabled}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
+    print(f"Class weights: {class_weights.tolist()}")
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = train_one_epoch(
