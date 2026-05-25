@@ -18,7 +18,16 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from utils.config import CLASS_NAMES, IMG_SIZE, MEAN, NUM_CLASSES, STD, STRIDES
+from utils.config import (
+    CLASS_FREQ_PRIOR_TRAIN,
+    CLASS_FREQ_PRIOR_VAL,
+    CLASS_NAMES,
+    IMG_SIZE,
+    MEAN,
+    NUM_CLASSES,
+    STD,
+    STRIDES,
+)
 from utils.image_ops import enhance_low_light_bgr
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
@@ -34,19 +43,31 @@ class Sample:
     labels: List[int]
 
 
-def compute_class_weights(samples: List[Sample], num_classes: int) -> torch.Tensor:
+def compute_class_weights(samples: List[Sample], num_classes: int, use_dataset_prior: bool = True) -> torch.Tensor:
     counts = np.zeros((num_classes,), dtype=np.float64)
     for s in samples:
         for y in s.labels:
             if 0 <= int(y) < num_classes:
                 counts[int(y)] += 1.0
-    counts = np.maximum(counts, 1.0)
-    beta = 0.999
-    effective_num = 1.0 - np.power(beta, counts)
-    weights = (1.0 - beta) / np.maximum(effective_num, 1e-12)
-    weights = weights / max(weights.mean(), 1e-12)
-    # Stabilize: do not over-suppress/over-amplify any class.
-    weights = np.clip(weights, 0.7, 3.5)
+
+    if use_dataset_prior and len(CLASS_FREQ_PRIOR_TRAIN) == num_classes and len(CLASS_FREQ_PRIOR_VAL) == num_classes:
+        prior_train = np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64)
+        prior_val = np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64)
+        prior = 0.5 * (prior_train + prior_val)
+        prior = np.clip(prior, 1e-6, None)
+        prior = prior / prior.sum()
+
+        # Safer weighting: inverse sqrt frequency (less aggressive than 1/freq).
+        weights = 1.0 / np.sqrt(prior)
+        weights = weights / max(weights.mean(), 1e-12)
+        weights = np.clip(weights, 0.5, 1.8)
+    else:
+        counts = np.maximum(counts, 1.0)
+        beta = 0.999
+        effective_num = 1.0 - np.power(beta, counts)
+        weights = (1.0 - beta) / np.maximum(effective_num, 1e-12)
+        weights = weights / max(weights.mean(), 1e-12)
+        weights = np.clip(weights, 0.7, 3.5)
     return torch.as_tensor(weights, dtype=torch.float32)
 
 
@@ -157,11 +178,11 @@ def make_pad_if_needed(img_size: int):
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
-        scale=(0.9, 1.1),
-        translate_percent=(-0.08, 0.08),
-        rotate=(-7, 7),
-        shear=(-2, 2),
-        p=0.3,
+        scale=(0.92, 1.08),
+        translate_percent=(-0.06, 0.06),
+        rotate=(-5, 5),
+        shear=(-1.5, 1.5),
+        p=0.25,
     )
     if "border_mode" in affine_params:
         affine_kwargs["border_mode"] = cv2.BORDER_CONSTANT
@@ -188,9 +209,9 @@ def get_train_transforms(img_size: int) -> A.Compose:
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
-            A.CLAHE(clip_limit=2.5, tile_grid_size=(8, 8), p=0.25),
-            A.RandomGamma(gamma_limit=(80, 130), p=0.3),
-            A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.08, p=0.6),
+            A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
+            A.RandomGamma(gamma_limit=(90, 120), p=0.2),
+            A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
             affine,
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
@@ -429,10 +450,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
-    parser.add_argument("--label_smoothing", type=float, default=0.05)
-    parser.add_argument("--center_radius", type=float, default=1.5)
+    parser.add_argument("--label_smoothing", type=float, default=0.03)
+    parser.add_argument("--center_radius", type=float, default=1.3)
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
+    parser.add_argument("--no_prior_class_weights", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     return parser.parse_args()
 
@@ -452,7 +474,11 @@ def main() -> None:
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
     val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
-    class_weights = compute_class_weights(train_samples, num_classes=num_classes)
+    class_weights = compute_class_weights(
+        train_samples,
+        num_classes=num_classes,
+        use_dataset_prior=not args.no_prior_class_weights,
+    )
     train_sampler = None
     if not args.no_balanced_sampling:
         sample_weights = build_sample_weights(train_samples, class_weights)
@@ -502,6 +528,7 @@ def main() -> None:
 
     print(f"Device: {device}, AMP: {amp_enabled}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
+    print(f"Class weight mode: {'dataset_prior(train+val)' if not args.no_prior_class_weights else 'empirical_train'}")
     print(f"Class weights: {class_weights.tolist()}")
 
     for epoch in range(start_epoch, args.epochs + 1):
