@@ -1,0 +1,249 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage{fontspec}
+\usepackage[vietnamese]{babel}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{hyperref}
+
+\geometry{left=2.5cm,right=2.0cm,top=2.5cm,bottom=2.5cm}
+\setmainfont{Times New Roman}
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue}
+
+\title{\textbf{Báo cáo dự án phát hiện đối tượng bằng mô hình Anchor-Free}}
+\author{Nhóm thực hiện}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Dự án xây dựng hệ thống phát hiện đối tượng cho 5 lớp \texttt{person}, \texttt{car}, \texttt{dog}, \texttt{cat}, \texttt{chair}. Mô hình chính sử dụng backbone ResNet34 pretrained, FPN 3 mức stride 8/16/32 và head anchor-free gồm phân loại, hồi quy hộp bao và centerness. Toàn bộ quy trình chạy thực nghiệm được đóng gói trong notebook \texttt{obj-detec.ipynb} để huấn luyện và đánh giá trên Google Colab GPU T4.
+\end{abstract}
+
+\section{Mục tiêu dự án}
+
+Mục tiêu là dự đoán hộp bao cho từng ảnh trong tập validation/test. Mỗi dự đoán gồm nhãn lớp, độ tin cậy và tọa độ hộp bao dạng \([x_{\min}, y_{\min}, x_{\max}, y_{\max}]\). Chỉ số đánh giá chính là mAP@0.5, tức mean Average Precision tại ngưỡng IoU 0.5.
+
+\section{Môi trường thực nghiệm}
+
+Thực nghiệm được thiết kế để chạy trên Google Colab với GPU T4. Notebook \texttt{obj-detec.ipynb} thực hiện tuần tự các bước:
+
+\begin{enumerate}
+  \item Clone hoặc pull repository vào \texttt{/content/O\_D}.
+  \item Kiểm tra GPU bằng \texttt{nvidia-smi} và kiểm tra CUDA trong PyTorch.
+  \item Cài đặt thư viện từ \texttt{requirements.txt}.
+  \item Huấn luyện bằng \texttt{train.py}.
+  \item Suy luận bằng \texttt{predict.py}.
+  \item Đánh giá bằng \texttt{public/tools/evaluate\_predictions.py}.
+  \item In kết quả trong \texttt{val\_score.json}.
+  \item Đóng gói project thành \texttt{/content/train.zip}, loại bỏ thư mục \texttt{public/}.
+\end{enumerate}
+
+Notebook đã được chỉnh từ luồng cũ dùng \texttt{/kaggle/working} sang luồng Colab dùng \texttt{/content/O\_D}. Cell gọi \texttt{img\_error.py} đã được bỏ vì dự án không còn xuất ảnh hardcase.
+
+\section{Dữ liệu}
+
+Tập dữ liệu gồm 5 lớp đối tượng. Annotation được lưu trong \texttt{public/annotations/train.json} và \texttt{public/annotations/val.json}.
+
+\begin{table}[h]
+\centering
+\caption{Thống kê số lượng ảnh và hộp bao}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Split & Images & Boxes & person & car & dog & cat & chair \\
+\midrule
+Train & 7500 & 10642 & 5829 & 1339 & 1028 & 833 & 1613 \\
+Val & 1500 & 2021 & 1074 & 283 & 206 & 176 & 282 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Phân bố lớp không cân bằng, trong đó \texttt{person} chiếm tỷ lệ lớn nhất. Các lớp \texttt{cat}, \texttt{dog}, \texttt{car} có ít mẫu hơn, nên pipeline huấn luyện sử dụng class weights và weighted sampling.
+
+\section{Kiến trúc mô hình}
+
+Mô hình được định nghĩa trong \texttt{utils/model.py}. Kiến trúc gồm:
+
+\begin{itemize}
+  \item Backbone: ResNet34 pretrained trên ImageNet.
+  \item Neck: FPN 3 mức, lấy feature map ở stride 8, 16 và 32.
+  \item Head: mỗi mức FPN có một anchor-free head riêng.
+  \item Output: \texttt{cls\_logits}, \texttt{reg\_preds}, \texttt{center\_logits}.
+\end{itemize}
+
+Ba mức FPN giúp mô hình xử lý vật thể ở nhiều kích thước. Điều này quan trọng với lớp \texttt{car}, vì nhiều xe trong ảnh validation có kích thước nhỏ hoặc ở xa.
+
+\section{Hàm mất mát}
+
+Hàm mất mát nằm trong \texttt{utils/loss.py}. Tổng loss:
+
+\begin{equation}
+L = \lambda_{cls} L_{cls} + \lambda_{reg} L_{reg} + \lambda_{ctr} L_{ctr}
+\end{equation}
+
+Trong đó:
+
+\begin{itemize}
+  \item \(L_{cls}\): sigmoid focal loss, có hỗ trợ class weights.
+  \item \(L_{reg}\): GIoU loss cho hộp bao.
+  \item \(L_{ctr}\): BCE-with-logits cho centerness.
+\end{itemize}
+
+Target assignment dùng center sampling, scale range theo từng mức FPN và ưu tiên ground truth có diện tích nhỏ nhất khi nhiều hộp cùng khớp một vị trí.
+
+\section{Huấn luyện}
+
+Script huấn luyện là \texttt{train.py}. Cấu hình chính:
+
+\begin{table}[h]
+\centering
+\caption{Cấu hình huấn luyện}
+\begin{tabular}{lr}
+\toprule
+Tham số & Giá trị \\
+\midrule
+Image size & 640 \\
+Batch size & 8 \\
+Epochs & 20 \\
+Optimizer & AdamW \\
+Learning rate backbone & \(2 \times 10^{-4}\) \\
+Learning rate head & \(2 \times 10^{-3}\) \\
+Weight decay & \(10^{-4}\) \\
+Scheduler & CosineAnnealingLR \\
+AMP & Bật khi dùng CUDA \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Cân bằng lớp}
+
+\texttt{train.py} dùng tần suất lớp trong \texttt{utils/config.py} để tạo class weights. Weighted sampler tăng xác suất chọn ảnh có lớp hiếm, ảnh đông đối tượng và ảnh chứa vật thể nhỏ. Cách này giúp giảm thiên lệch về lớp phổ biến mà không cần nhân bản dữ liệu thủ công.
+
+\subsection{Augmentation}
+
+Augmentation được chỉnh theo hướng phù hợp hơn với ảnh tự nhiên và lớp \texttt{car}:
+
+\begin{itemize}
+  \item Bỏ \texttt{VerticalFlip}, vì xe, người và ghế hiếm khi xuất hiện lật dọc.
+  \item Bỏ \texttt{RandomRotate90}, vì xoay 90 độ làm phân phối ảnh không thực tế.
+  \item Giữ \texttt{HorizontalFlip}, CLAHE, gamma, blur và color jitter.
+  \item Thêm JPEG compression nhẹ để mô hình chịu được ảnh nén.
+  \item Thêm coarse dropout nhẹ để mô phỏng che khuất một phần.
+  \item Tăng nhẹ affine scale, translate và rotate trong biên độ nhỏ.
+\end{itemize}
+
+\section{Suy luận và hậu xử lý}
+
+Script suy luận là \texttt{predict.py}. Pipeline gồm:
+
+\begin{enumerate}
+  \item Đọc ảnh bằng hàm hỗ trợ đường dẫn Unicode.
+  \item Tăng sáng có điều kiện cho ảnh tối.
+  \item Letterbox ảnh về kích thước 640 nhưng giữ tỷ lệ ảnh gốc.
+  \item Chạy batch inference trên GPU.
+  \item Decode output từ 3 mức FPN bằng \texttt{utils/nms.py}.
+  \item Kết hợp class score với centerness theo chế độ \texttt{sqrt}.
+  \item Lọc confidence, class-wise NMS và map hộp bao về ảnh gốc.
+  \item Áp dụng threshold theo lớp và giới hạn số box mỗi ảnh.
+  \item Xuất \texttt{val\_predictions.json}.
+\end{enumerate}
+
+Phiên bản hiện tại đã bỏ phần tạo \texttt{results/hardcase\_summary.json}, bỏ các tham số \texttt{--results\_dir}, \texttt{--hardcase\_topk}, \texttt{--hardcase\_iou}, và không còn ghi ảnh lỗi vào \texttt{results/}. File \texttt{img\_error.py} cũng đã được loại bỏ vì chỉ phục vụ render hardcase.
+
+\section{Kết quả thực nghiệm}
+
+Checkpoint tốt nhất hiện có:
+
+\begin{table}[h]
+\centering
+\caption{Thông tin checkpoint}
+\begin{tabular}{lr}
+\toprule
+Thuộc tính & Giá trị \\
+\midrule
+Epoch & 18 \\
+Best validation loss & 0.689164 \\
+Image size & 640 \\
+Classes & person, car, dog, cat, chair \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Kết quả đánh giá trên tập validation:
+
+\begin{table}[h]
+\centering
+\caption{Chỉ số tổng}
+\begin{tabular}{lr}
+\toprule
+Metric & Giá trị \\
+\midrule
+mAP@0.5 & 0.722545 \\
+Performance points & 20 \\
+Ground truth boxes & 2021 \\
+Predictions & 4053 \\
+Micro precision & 0.399457 \\
+Micro recall & 0.801089 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Chỉ số theo từng lớp}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Class & AP & Recall & Precision & GT & Pred & TP & FP \\
+\midrule
+person & 0.782319 & 0.818436 & 0.571150 & 1074 & 1539 & 879 & 660 \\
+car & 0.684412 & 0.777385 & 0.254042 & 283 & 866 & 220 & 646 \\
+dog & 0.775038 & 0.854369 & 0.385965 & 206 & 456 & 176 & 280 \\
+cat & 0.857270 & 0.880682 & 0.593870 & 176 & 261 & 155 & 106 \\
+chair & 0.513688 & 0.670213 & 0.203008 & 282 & 931 & 189 & 742 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Nhận xét kết quả}
+
+Mô hình đạt mAP@0.5 là 0.722545 và đạt 20 performance points. Lớp \texttt{cat} có AP cao nhất, trong khi \texttt{chair} thấp nhất. Lớp \texttt{car} có recall tương đối tốt nhưng precision thấp, nghĩa là mô hình phát hiện được nhiều xe thật nhưng cũng sinh nhiều false positive. Vì vậy hướng cải thiện hợp lý là giảm false positive bằng hard negative, calibration confidence và augmentation tự nhiên, thay vì chỉ oversample \texttt{car}.
+
+\section{Mô tả chỉnh sửa theo file}
+
+\begin{longtable}{p{0.25\textwidth}p{0.67\textwidth}}
+\toprule
+File & Vai trò và chỉnh sửa \\
+\midrule
+\texttt{obj-detec.ipynb} & Notebook chạy trên Google Colab T4. Đã chỉnh sang đường dẫn \texttt{/content/O\_D}, thêm cell kiểm tra GPU, train, predict, evaluate, in \texttt{val\_score.json} và zip output. Đã bỏ cell gọi \texttt{img\_error.py}. \\
+\texttt{train.py} & Huấn luyện mô hình, parse annotation, dataloader, class weights, weighted sampler, AMP, AdamW, scheduler và checkpoint. Augmentation đã chỉnh car-friendly: bỏ lật dọc/xoay 90 độ, thêm JPEG compression và coarse dropout nhẹ. \\
+\texttt{predict.py} & Suy luận và xuất JSON. Có low-light enhancement, letterbox, batch inference, decode multi-level, class-wise NMS, threshold theo lớp và suppress \texttt{chair} nằm trong \texttt{person}. Đã bỏ export hardcase summary và ảnh hardcase. \\
+\texttt{utils/config.py} & Chứa cấu hình lớp, image size, stride, threshold, score scale, class weights, low-light enhancement và trọng số loss. \\
+\texttt{utils/model.py} & Định nghĩa ResNet34 backbone, FPN 3 mức và anchor-free heads. \\
+\texttt{utils/loss.py} & Định nghĩa focal loss, GIoU loss, centerness loss, center sampling và scale range target assignment. \\
+\texttt{utils/nms.py} & Decode dự đoán, kết hợp class score với centerness, confidence filtering, class-wise NMS và remap bbox về ảnh gốc. \\
+\texttt{utils/runtime.py} & Tiện ích chọn device, tóm tắt GPU, chọn số worker, optimizer, scheduler và checkpoint. \\
+\texttt{utils/image\_ops.py} & Tăng sáng ảnh low-light bằng CLAHE và gamma correction. \\
+\texttt{utils/process.py} & Tiện ích xử lý annotation, đọc ảnh, resize, vẽ bbox và mosaic. \\
+\texttt{utils/forecast.py} & Head/decoder thử nghiệm cho anchor-free detection, dùng làm phần tham khảo so với pipeline chính. \\
+\bottomrule
+\end{longtable}
+
+\section{Hướng phát triển}
+
+\begin{itemize}
+  \item Bổ sung hard negative cho \texttt{car} và \texttt{chair} để giảm false positive.
+  \item Thử hiệu chỉnh confidence threshold theo lớp sau khi train lại.
+  \item Thử tăng \texttt{img\_size} lên 704 nếu GPU T4 còn đủ bộ nhớ.
+  \item Đánh giá lại sau augmentation car-friendly để kiểm tra tác động lên từng lớp.
+\end{itemize}
+
+\section{Kết luận}
+
+Pipeline hiện tại đã hoàn chỉnh từ dữ liệu, huấn luyện, suy luận đến đánh giá trong một notebook Colab T4. Mô hình anchor-free ResNet34 FPN đạt mAP@0.5 bằng 0.722545 trên validation set. Các chỉnh sửa gần đây giúp workflow gọn hơn, loại bỏ hardcase artifact không cần thiết và đưa augmentation về phân phối ảnh tự nhiên hơn.
+
+\end{document}

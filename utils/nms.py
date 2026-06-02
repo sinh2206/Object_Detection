@@ -8,7 +8,7 @@ This module is synchronized with `utils/model.py` output format:
   "cls_logits": [Tensor(B,C,H,W), Tensor(B,C,H,W)],
   "reg_preds": [Tensor(B,4,H,W), Tensor(B,4,H,W)],   # (t,l,b,r)
   "center_logits": [Tensor(B,1,H,W), Tensor(B,1,H,W)] optional,
-  "strides": [16, 32]
+  "strides": [8, 16, 32]
 }
 
 Pipeline:
@@ -26,30 +26,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 try:
-    from .config import (
-        AGNOSTIC_NMS_IOU_THRESH,
-        CLASS_NAMES,
-        CONF_THRESH,
-        CROSS_CLASS_CONTAIN_THRESH,
-        CROSS_CLASS_IOU_THRESH,
-        IMG_SIZE,
-        NMS_IOU_THRESH,
-        NUM_CLASSES,
-        SAME_CLASS_CONTAIN_THRESH,
-        STRIDES,
-    )
+    from .config import CLASS_NAMES, CLASS_SCORE_SCALES, CONF_THRESH, IMG_SIZE, INFER_CENTER_COMBINE, MAX_OBJECTS_PER_IMAGE, MIN_BOX_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
-    CONF_THRESH = 0.5
-    NMS_IOU_THRESH = 0.35
-    AGNOSTIC_NMS_IOU_THRESH = 0.75
-    CROSS_CLASS_IOU_THRESH = 0.85
-    CROSS_CLASS_CONTAIN_THRESH = 0.9
-    SAME_CLASS_CONTAIN_THRESH = 0.82
+    CLASS_SCORE_SCALES = [1.0 for _ in CLASS_NAMES]
+    INFER_CENTER_COMBINE = "cls"
+    CONF_THRESH = 0.50
+    NMS_IOU_THRESH = 0.50
     IMG_SIZE = 320
     NUM_CLASSES = 5
-    STRIDES = [16, 32]
+    STRIDES = [8, 16, 32]
+    MAX_OBJECTS_PER_IMAGE = 15
+    MIN_BOX_SIZE = 1.0
 
 
 @dataclass
@@ -120,13 +109,16 @@ def _classification_scores(
     - cls_id:    (H,W) in [0..num_classes-1]
 
     Cases:
-    - logits channels == num_classes: softmax over C channels.
+    - logits channels == num_classes: sigmoid over C channels.
     - logits channels == num_classes+1: treat one channel as background.
     """
     c, _, _ = cls_logits.shape
 
     if c == num_classes:
-        prob = torch.softmax(cls_logits, dim=0)
+        prob = torch.sigmoid(cls_logits)
+        if len(CLASS_SCORE_SCALES) == int(num_classes):
+            scale = torch.as_tensor(CLASS_SCORE_SCALES, dtype=prob.dtype, device=prob.device).view(-1, 1, 1)
+            prob = torch.clamp(prob * scale, min=0.0, max=1.0)
         cls_score, cls_id = prob.max(dim=0)
         return cls_score, cls_id
 
@@ -140,6 +132,9 @@ def _classification_scores(
 
         fg_indices = [i for i in range(c) if i != background_index]
         fg_prob = prob[fg_indices, :, :]
+        if len(CLASS_SCORE_SCALES) == int(num_classes):
+            scale = torch.as_tensor(CLASS_SCORE_SCALES, dtype=fg_prob.dtype, device=fg_prob.device).view(-1, 1, 1)
+            fg_prob = torch.clamp(fg_prob * scale, min=0.0, max=1.0)
 
         fg_max, fg_id_local = fg_prob.max(dim=0)
         fg_score = 1.0 - prob[background_index, :, :]
@@ -166,7 +161,7 @@ def decode_level(
     conf_thresh: float = CONF_THRESH,
     num_classes: int = NUM_CLASSES,
     reg_decode: str = "auto",
-    center_combine: str = "mul",
+    center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -203,6 +198,12 @@ def decode_level(
         center_combine = center_combine.lower()
         if center_combine == "sqrt":
             conf = torch.sqrt((cls_score * center).clamp(min=1e-12))
+        elif center_combine == "soft":
+            # Keep some centerness influence without collapsing confident class
+            # responses on crowded scenes.
+            conf = cls_score * (0.5 + 0.5 * center)
+        elif center_combine == "cls":
+            conf = cls_score
         else:
             conf = cls_score * center
     else:
@@ -254,7 +255,7 @@ def decode_multilevel(
     num_classes: int = NUM_CLASSES,
     strides: Optional[Sequence[int]] = None,
     reg_decode: str = "auto",
-    center_combine: str = "mul",
+    center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -336,21 +337,76 @@ def _box_iou_xyxy(one: torch.Tensor, many: torch.Tensor) -> torch.Tensor:
     return inter / union
 
 
-def _intersection_over_small(one: torch.Tensor, many: torch.Tensor) -> torch.Tensor:
-    """Intersection over min(area_one, area_many)."""
-    xx1 = torch.maximum(one[0], many[:, 0])
-    yy1 = torch.maximum(one[1], many[:, 1])
-    xx2 = torch.minimum(one[2], many[:, 2])
-    yy2 = torch.minimum(one[3], many[:, 3])
+def _is_fully_inside_xyxy(inner: torch.Tensor, outer: torch.Tensor) -> bool:
+    return bool(
+        float(inner[0]) >= float(outer[0])
+        and float(inner[1]) >= float(outer[1])
+        and float(inner[2]) <= float(outer[2])
+        and float(inner[3]) <= float(outer[3])
+    )
 
-    inter_w = (xx2 - xx1).clamp(min=0)
-    inter_h = (yy2 - yy1).clamp(min=0)
-    inter = inter_w * inter_h
 
-    area_one = (one[2] - one[0]).clamp(min=0) * (one[3] - one[1]).clamp(min=0)
-    area_many = (many[:, 2] - many[:, 0]).clamp(min=0) * (many[:, 3] - many[:, 1]).clamp(min=0)
-    denom = torch.minimum(area_one.expand_as(area_many), area_many).clamp(min=1e-6)
-    return inter / denom
+def _box_area_xyxy(box: torch.Tensor) -> float:
+    return float(max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1])))
+
+
+def _suppress_same_class_contained(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    class_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if boxes.numel() == 0:
+        return boxes, scores, class_ids
+
+    order = torch.argsort(scores, descending=True)
+    keep: List[int] = []
+
+    for idx in order.tolist():
+        cls = int(class_ids[idx].item())
+        candidate = boxes[idx]
+        candidate_score = float(scores[idx].item())
+        candidate_area = _box_area_xyxy(candidate)
+        drop = False
+        replace_slot = -1
+
+        for slot, kept_idx in enumerate(keep):
+            if int(class_ids[kept_idx].item()) != cls:
+                continue
+            kept_box = boxes[kept_idx]
+            kept_score = float(scores[kept_idx].item())
+            kept_area = _box_area_xyxy(kept_box)
+
+            cand_inside_kept = _is_fully_inside_xyxy(candidate, kept_box)
+            kept_inside_cand = _is_fully_inside_xyxy(kept_box, candidate)
+            if not (cand_inside_kept or kept_inside_cand):
+                continue
+
+            # If one box fully contains the other and scores are close, prefer
+            # the larger box to avoid losing full-object detections.
+            if kept_inside_cand and candidate_area > kept_area and candidate_score + 0.03 >= kept_score:
+                replace_slot = slot
+                break
+
+            drop = True
+            break
+
+        if replace_slot >= 0:
+            keep[replace_slot] = idx
+            continue
+
+        if not drop:
+            keep.append(idx)
+
+    if not keep:
+        device = boxes.device
+        return (
+            torch.zeros((0, 4), dtype=boxes.dtype, device=device),
+            torch.zeros((0,), dtype=scores.dtype, device=device),
+            torch.zeros((0,), dtype=class_ids.dtype, device=device),
+        )
+
+    keep_idx = torch.tensor(keep, dtype=torch.long, device=boxes.device)
+    return boxes[keep_idx], scores[keep_idx], class_ids[keep_idx]
 
 
 def nms_single_class(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
@@ -415,85 +471,6 @@ def class_wise_nms(
     return keep
 
 
-def class_agnostic_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
-    """Apply one more NMS pass without class separation."""
-    return nms_single_class(boxes=boxes, scores=scores, iou_thresh=float(iou_thresh))
-
-
-def suppress_cross_class_duplicates(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    class_ids: torch.Tensor,
-    iou_thresh: float,
-    contain_thresh: float,
-) -> torch.Tensor:
-    """
-    Remove lower-score boxes from different classes when they almost fully overlap.
-
-    This helps with errors like 'chair' predicted inside a high-confidence 'person'.
-    """
-    if boxes.numel() == 0:
-        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
-
-    order = torch.argsort(scores, descending=True)
-    keep: List[int] = []
-
-    for idx in order.tolist():
-        cand_box = boxes[idx]
-        cand_cls = class_ids[idx]
-        drop = False
-        if keep:
-            kept_idx = torch.tensor(keep, dtype=torch.long, device=boxes.device)
-            kept_boxes = boxes[kept_idx]
-            kept_cls = class_ids[kept_idx]
-            cross_cls = kept_cls != cand_cls
-            if torch.any(cross_cls):
-                cross_boxes = kept_boxes[cross_cls]
-                iou = _box_iou_xyxy(cand_box, cross_boxes)
-                ios = _intersection_over_small(cand_box, cross_boxes)
-                if torch.any((iou > float(iou_thresh)) | (ios > float(contain_thresh))):
-                    drop = True
-        if not drop:
-            keep.append(idx)
-
-    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
-
-
-def suppress_same_class_containment(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    class_ids: torch.Tensor,
-    contain_thresh: float,
-) -> torch.Tensor:
-    """
-    Remove lower-score duplicates of the same class when one box is almost contained in another.
-    """
-    if boxes.numel() == 0:
-        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
-
-    order = torch.argsort(scores, descending=True)
-    keep: List[int] = []
-
-    for idx in order.tolist():
-        cand_box = boxes[idx]
-        cand_cls = class_ids[idx]
-        drop = False
-        if keep:
-            kept_idx = torch.tensor(keep, dtype=torch.long, device=boxes.device)
-            kept_boxes = boxes[kept_idx]
-            kept_cls = class_ids[kept_idx]
-            same_cls = kept_cls == cand_cls
-            if torch.any(same_cls):
-                same_boxes = kept_boxes[same_cls]
-                ios = _intersection_over_small(cand_box, same_boxes)
-                if torch.any(ios > float(contain_thresh)):
-                    drop = True
-        if not drop:
-            keep.append(idx)
-
-    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
-
-
 def remap_boxes_to_original(boxes: torch.Tensor, meta: LetterboxMeta) -> torch.Tensor:
     """
     Convert boxes from letterbox (IMG_SIZE space) to original image coordinates.
@@ -519,7 +496,7 @@ def remap_boxes_to_original(boxes: torch.Tensor, meta: LetterboxMeta) -> torch.T
     return out
 
 
-def filter_small_boxes(boxes: torch.Tensor, min_size: float = 2.0) -> torch.Tensor:
+def filter_small_boxes(boxes: torch.Tensor, min_size: float = MIN_BOX_SIZE) -> torch.Tensor:
     """Return boolean mask keeping boxes with width/height >= min_size."""
     if boxes.numel() == 0:
         return torch.zeros((0,), dtype=torch.bool, device=boxes.device)
@@ -540,13 +517,9 @@ def postprocess_single_image(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
-    center_combine: str = "mul",
+    center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
-    min_box_size: float = 2.0,
-    agnostic_nms_thresh: float = AGNOSTIC_NMS_IOU_THRESH,
-    same_class_contain_thresh: float = SAME_CLASS_CONTAIN_THRESH,
-    cross_class_iou_thresh: float = CROSS_CLASS_IOU_THRESH,
-    cross_class_contain_thresh: float = CROSS_CLASS_CONTAIN_THRESH,
+    min_box_size: float = MIN_BOX_SIZE,
 ) -> Dict[str, Any]:
     """
     Full decode + NMS + remap pipeline for one image.
@@ -589,35 +562,6 @@ def postprocess_single_image(
     scores = scores[keep]
     cls_ids = cls_ids[keep]
 
-    if agnostic_nms_thresh > 0:
-        keep = class_agnostic_nms(boxes=boxes, scores=scores, iou_thresh=agnostic_nms_thresh)
-        boxes = boxes[keep]
-        scores = scores[keep]
-        cls_ids = cls_ids[keep]
-
-    if same_class_contain_thresh > 0:
-        keep = suppress_same_class_containment(
-            boxes=boxes,
-            scores=scores,
-            class_ids=cls_ids,
-            contain_thresh=max(0.0, same_class_contain_thresh),
-        )
-        boxes = boxes[keep]
-        scores = scores[keep]
-        cls_ids = cls_ids[keep]
-
-    if cross_class_iou_thresh > 0 or cross_class_contain_thresh > 0:
-        keep = suppress_cross_class_duplicates(
-            boxes=boxes,
-            scores=scores,
-            class_ids=cls_ids,
-            iou_thresh=max(0.0, cross_class_iou_thresh),
-            contain_thresh=max(0.0, cross_class_contain_thresh),
-        )
-        boxes = boxes[keep]
-        scores = scores[keep]
-        cls_ids = cls_ids[keep]
-
     if letterbox_meta is not None:
         boxes = remap_boxes_to_original(boxes, letterbox_meta)
 
@@ -625,6 +569,14 @@ def postprocess_single_image(
     boxes = boxes[valid]
     scores = scores[valid]
     cls_ids = cls_ids[valid]
+
+    boxes, scores, cls_ids = _suppress_same_class_contained(boxes, scores, cls_ids)
+
+    if boxes.shape[0] > int(MAX_OBJECTS_PER_IMAGE):
+        topk = torch.argsort(scores, descending=True)[: int(MAX_OBJECTS_PER_IMAGE)]
+        boxes = boxes[topk]
+        scores = scores[topk]
+        cls_ids = cls_ids[topk]
 
     pred_boxes: List[Dict[str, Any]] = []
     for b, s, c in zip(boxes.tolist(), scores.tolist(), cls_ids.tolist()):
@@ -655,13 +607,9 @@ def postprocess_batch(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
-    center_combine: str = "mul",
+    center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
-    min_box_size: float = 2.0,
-    agnostic_nms_thresh: float = AGNOSTIC_NMS_IOU_THRESH,
-    same_class_contain_thresh: float = SAME_CLASS_CONTAIN_THRESH,
-    cross_class_iou_thresh: float = CROSS_CLASS_IOU_THRESH,
-    cross_class_contain_thresh: float = CROSS_CLASS_CONTAIN_THRESH,
+    min_box_size: float = MIN_BOX_SIZE,
 ) -> List[Dict[str, Any]]:
     """Batch wrapper for JSON-ready predictions."""
     bsz = outputs["cls_logits"][0].shape[0]
@@ -690,10 +638,6 @@ def postprocess_batch(
                 center_combine=center_combine,
                 background_index=background_index,
                 min_box_size=min_box_size,
-                agnostic_nms_thresh=agnostic_nms_thresh,
-                same_class_contain_thresh=same_class_contain_thresh,
-                cross_class_iou_thresh=cross_class_iou_thresh,
-                cross_class_contain_thresh=cross_class_contain_thresh,
             )
         )
     return results

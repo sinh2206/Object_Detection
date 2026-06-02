@@ -19,16 +19,24 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from utils.config import (
+    CENTER_RADIUS,
     CLASS_FREQ_PRIOR_TRAIN,
     CLASS_FREQ_PRIOR_VAL,
+    CLASS_LOSS_WEIGHTS,
     CLASS_NAMES,
+    CLASS_SAMPLER_WEIGHTS,
     IMG_SIZE,
+    LABEL_SMOOTHING,
+    LOW_LIGHT_CLAHE_CLIP,
+    LOW_LIGHT_GAMMA,
+    LOW_LIGHT_MEAN_THRESH,
     MEAN,
     NUM_CLASSES,
+    SMALL_OBJECT_AREA_RATIO,
+    SMALL_OBJECT_BONUS,
     STD,
     STRIDES,
 )
-from utils.image_ops import enhance_low_light_bgr
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
 
@@ -39,54 +47,82 @@ VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 class Sample:
     image_id: str
     image_path: Path
+    width: int
+    height: int
     boxes: List[List[float]]
     labels: List[int]
 
 
-def compute_class_weights(samples: List[Sample], num_classes: int, use_dataset_prior: bool = True) -> torch.Tensor:
-    counts = np.zeros((num_classes,), dtype=np.float64)
-    for s in samples:
-        for y in s.labels:
-            if 0 <= int(y) < num_classes:
-                counts[int(y)] += 1.0
+def compute_class_weights(num_classes: int) -> torch.Tensor:
+    if num_classes <= 0:
+        return torch.zeros((0,), dtype=torch.float32)
 
-    if use_dataset_prior and len(CLASS_FREQ_PRIOR_TRAIN) == num_classes and len(CLASS_FREQ_PRIOR_VAL) == num_classes:
-        prior_train = np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64)
-        prior_val = np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64)
-        prior = 0.5 * (prior_train + prior_val)
-        prior = np.clip(prior, 1e-6, None)
-        prior = prior / prior.sum()
+    freq_train = np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64)
+    freq_val = np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64)
+    if freq_train.size != num_classes or freq_val.size != num_classes:
+        weights = np.ones((num_classes,), dtype=np.float64)
+        return torch.as_tensor(weights, dtype=torch.float32)
 
-        # Safer weighting: inverse sqrt frequency (less aggressive than 1/freq).
-        weights = 1.0 / np.sqrt(prior)
-        weights = weights / max(weights.mean(), 1e-12)
-        weights = np.clip(weights, 0.5, 1.8)
-    else:
-        counts = np.maximum(counts, 1.0)
-        beta = 0.999
-        effective_num = 1.0 - np.power(beta, counts)
-        weights = (1.0 - beta) / np.maximum(effective_num, 1e-12)
-        weights = weights / max(weights.mean(), 1e-12)
-        weights = np.clip(weights, 0.7, 3.5)
+    freq = 0.5 * (freq_train + freq_val)
+    freq = np.clip(freq, 1e-6, None)
+
+    # Base inverse-frequency weight, softened by sqrt to avoid exploding the
+    # minority classes. A mild class-specific boost is applied afterwards.
+    weights = np.power(freq.mean() / freq, 0.5)
+    class_boost = np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
+    if class_boost.size != num_classes:
+        class_boost = np.ones((num_classes,), dtype=np.float64)
+    weights = weights * class_boost
+    weights = weights / max(weights.mean(), 1e-12)
+    # Keep dominant class penalized enough to reduce person-overprediction
+    # while still allowing minority classes to be upweighted.
+    weights = np.clip(weights, 0.45, 2.20)
     return torch.as_tensor(weights, dtype=torch.float32)
 
 
 def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> torch.Tensor:
     cw = class_weights.cpu().numpy().astype(np.float64)
+    class_sampler_weights = np.asarray(CLASS_SAMPLER_WEIGHTS, dtype=np.float64)
+    if class_sampler_weights.size != cw.size:
+        class_sampler_weights = np.ones_like(cw)
+
     ws = np.ones((len(samples),), dtype=np.float64)
     for i, s in enumerate(samples):
         if len(s.labels) == 0:
+            # Do not downsample empty scenes; they are important for lowering
+            # false positives on background-only images.
             ws[i] = 1.0
             continue
-        uniq = np.unique(np.asarray(s.labels, dtype=np.int64))
-        uniq = uniq[(uniq >= 0) & (uniq < len(cw))]
-        if uniq.size == 0:
+        labels = np.asarray(s.labels, dtype=np.int64)
+        labels = labels[(labels >= 0) & (labels < len(cw))]
+        if labels.size == 0:
             ws[i] = 1.0
             continue
-        # Emphasize images containing rare classes.
-        ws[i] = float(np.max(cw[uniq]))
+        # Use all labels, not just unique classes, so crowded scenes with many
+        # objects get sampled more often.
+        base_weight = float(np.mean(cw[labels] * class_sampler_weights[labels]))
+        crowd_bonus = 1.0 + 0.12 * float(min(labels.size, 10))
+        small_bonus = 1.0
+        if s.width > 0 and s.height > 0 and len(s.boxes) > 0:
+            img_area = float(max(s.width * s.height, 1))
+            box_areas = np.asarray(
+                [
+                    max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+                    for box in s.boxes
+                ],
+                dtype=np.float64,
+            )
+            if box_areas.size > 0:
+                area_ratios = box_areas / img_area
+                smallness = np.mean(
+                    np.clip((float(SMALL_OBJECT_AREA_RATIO) - area_ratios) / float(SMALL_OBJECT_AREA_RATIO), 0.0, 1.0)
+                )
+                small_bonus = 1.0 + float(SMALL_OBJECT_BONUS) * float(smallness)
+
+        ws[i] = max(1.0, base_weight * crowd_bonus * small_bonus)
+
     ws = ws / max(ws.mean(), 1e-12)
-    ws = np.clip(ws, 0.2, 6.0)
+    ws = np.clip(ws, 0.25, 4.5)
     return torch.as_tensor(ws, dtype=torch.double)
 
 
@@ -104,6 +140,24 @@ def imread_unicode(path: Path) -> Optional[np.ndarray]:
     if arr.size == 0:
         return None
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def enhance_low_light_bgr(image_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    if float(gray.mean()) >= float(LOW_LIGHT_MEAN_THRESH):
+        return image_bgr
+
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=float(LOW_LIGHT_CLAHE_CLIP), tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    merged = cv2.merge([l, a, b])
+    out = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+    lut = np.array([((i / 255.0) ** float(LOW_LIGHT_GAMMA)) * 255.0 for i in range(256)], dtype=np.float32)
+    lut = np.clip(lut, 0, 255).astype(np.uint8)
+    out = cv2.LUT(out, lut)
+    return out
 
 
 def load_annotation(annotation_path: Path) -> dict:
@@ -137,6 +191,13 @@ def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[
             else:
                 continue
 
+        width = int(im.get("width", 0) or 0)
+        height = int(im.get("height", 0) or 0)
+        if width <= 0 or height <= 0:
+            image = imread_unicode(image_path)
+            if image is not None:
+                height, width = image.shape[:2]
+
         boxes: List[List[float]] = []
         labels: List[int] = []
         for ann in ann_by_image.get(image_id, []):
@@ -149,7 +210,16 @@ def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[
             boxes.append([x1, y1, x2, y2])
             labels.append(class_to_idx[cls_name])
 
-        samples.append(Sample(image_id=image_id, image_path=image_path, boxes=boxes, labels=labels))
+        samples.append(
+            Sample(
+                image_id=image_id,
+                image_path=image_path,
+                width=int(width),
+                height=int(height),
+                boxes=boxes,
+                labels=labels,
+            )
+        )
 
     if not samples:
         raise ValueError(f"No valid samples from {annotation_path} with image_dir={image_dir}")
@@ -175,13 +245,61 @@ def make_pad_if_needed(img_size: int):
     return A.PadIfNeeded(**kwargs)
 
 
+def make_coarse_dropout(img_size: int):
+    params = inspect.signature(A.CoarseDropout.__init__).parameters
+    kwargs = {"p": 0.18}
+
+    if "num_holes_range" in params:
+        kwargs.update(
+            {
+                "num_holes_range": (1, 3),
+                "hole_height_range": (0.03, 0.10),
+                "hole_width_range": (0.03, 0.14),
+            }
+        )
+        if "fill" in params:
+            kwargs["fill"] = (114, 114, 114)
+        if "fill_mask" in params:
+            kwargs["fill_mask"] = 0
+    else:
+        kwargs.update(
+            {
+                "min_holes": 1,
+                "max_holes": 3,
+                "min_height": max(4, int(0.03 * img_size)),
+                "max_height": max(8, int(0.10 * img_size)),
+                "min_width": max(4, int(0.03 * img_size)),
+                "max_width": max(8, int(0.14 * img_size)),
+            }
+        )
+        if "fill_value" in params:
+            kwargs["fill_value"] = (114, 114, 114)
+        if "mask_fill_value" in params:
+            kwargs["mask_fill_value"] = 0
+
+    return A.CoarseDropout(**kwargs)
+
+
+def make_image_compression():
+    params = inspect.signature(A.ImageCompression.__init__).parameters
+    kwargs = {"p": 0.18}
+    if "quality_range" in params:
+        kwargs["quality_range"] = (65, 95)
+    else:
+        if "quality_lower" in params:
+            kwargs["quality_lower"] = 65
+        if "quality_upper" in params:
+            kwargs["quality_upper"] = 95
+    return A.ImageCompression(**kwargs)
+
+
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
-        scale=(0.92, 1.08),
-        translate_percent=(-0.06, 0.06),
+        scale=(0.82, 1.28),
+        translate_percent=(-0.05, 0.05),
         rotate=(-5, 5),
-        shear=(-1.5, 1.5),
+        shear=(-1.0, 1.0),
         p=0.25,
     )
     if "border_mode" in affine_params:
@@ -204,23 +322,39 @@ def get_train_transforms(img_size: int) -> A.Compose:
 
     affine = A.Affine(**affine_kwargs)
 
+    downscale_params = inspect.signature(A.Downscale.__init__).parameters
+    if "scale_range" in downscale_params:
+        downscale_aug = A.Downscale(scale_range=(0.60, 0.85), p=1.0)
+    else:
+        downscale_aug = A.Downscale(scale_min=0.60, scale_max=0.85, p=1.0)
+
     return A.Compose(
         [
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
-            A.RandomGamma(gamma_limit=(90, 120), p=0.2),
+            A.OneOf(
+                [
+                    A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+                    A.MotionBlur(blur_limit=5, p=1.0),
+                    downscale_aug,
+                    make_image_compression(),
+                ],
+                p=0.35,
+            ),
+            A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
             affine,
+            make_coarse_dropout(img_size),
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
         ],
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_area=4.0,
-            min_visibility=0.2,
+            min_area=0.0,
+            min_visibility=0.0,
             clip=True,
         ),
     )
@@ -237,7 +371,7 @@ def get_val_transforms(img_size: int) -> A.Compose:
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_area=1.0,
+            min_area=0.0,
             min_visibility=0.0,
             clip=True,
         ),
@@ -336,7 +470,7 @@ def train_one_epoch(
     steps = 0
 
     for images, targets in loader:
-        images = images.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -376,7 +510,7 @@ def validate_one_epoch(
     steps = 0
 
     for images, targets in loader:
-        images = images.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
 
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
@@ -397,7 +531,11 @@ def validate_one_epoch(
 
 def build_optimizer(model: AnchorFreeDetector, lr_backbone: float, lr_head: float, weight_decay: float) -> torch.optim.Optimizer:
     backbone_params = list(model.backbone_fpn.parameters())
-    head_params = list(model.head_s16.parameters()) + list(model.head_s32.parameters())
+    head_params = (
+        list(model.head_s8.parameters())
+        + list(model.head_s16.parameters())
+        + list(model.head_s32.parameters())
+    )
 
     return AdamW(
         [
@@ -435,26 +573,26 @@ def save_checkpoint(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train anchor-free detector (ResNet18 + 2-level FPN).")
+    parser = argparse.ArgumentParser(description="Train anchor-free detector (ResNet34 + 3-level FPN).")
     parser.add_argument("--train_data", type=Path, required=True)
     parser.add_argument("--val_data", type=Path, required=True)
     parser.add_argument("--image_dir", type=Path, required=True)
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
-    parser.add_argument("--label_smoothing", type=float, default=0.03)
-    parser.add_argument("--center_radius", type=float, default=1.3)
+    parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
+    parser.add_argument("--center_radius", type=float, default=CENTER_RADIUS)
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
-    parser.add_argument("--no_prior_class_weights", action="store_true")
+    parser.add_argument("--no_class_weights", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     return parser.parse_args()
 
@@ -463,6 +601,9 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
     torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
@@ -474,13 +615,9 @@ def main() -> None:
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
     val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
-    class_weights = compute_class_weights(
-        train_samples,
-        num_classes=num_classes,
-        use_dataset_prior=not args.no_prior_class_weights,
-    )
+    class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
     train_sampler = None
-    if not args.no_balanced_sampling:
+    if not args.no_balanced_sampling and class_weights is not None:
         sample_weights = build_sample_weights(train_samples, class_weights)
         train_sampler = WeightedRandomSampler(
             weights=sample_weights,
@@ -497,7 +634,7 @@ def main() -> None:
     )
     val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device)
+    model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
     criterion = DetectionLoss(
         num_classes=num_classes,
         strides=STRIDES,
@@ -514,7 +651,13 @@ def main() -> None:
     best_val_loss = float("inf")
     if args.resume is not None and args.resume.exists():
         ckpt = torch.load(str(args.resume), map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        try:
+            model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        except RuntimeError as exc:
+            missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            print(f"Resume checkpoint partially loaded ({exc}).")
+            print(f"Missing keys: {missing}")
+            print(f"Unexpected keys: {unexpected}")
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
@@ -528,8 +671,10 @@ def main() -> None:
 
     print(f"Device: {device}, AMP: {amp_enabled}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
-    print(f"Class weight mode: {'dataset_prior(train+val)' if not args.no_prior_class_weights else 'empirical_train'}")
-    print(f"Class weights: {class_weights.tolist()}")
+    print(f"Balanced sampling: {not args.no_balanced_sampling}")
+    print(f"Class weights enabled: {not args.no_class_weights}")
+    if class_weights is not None:
+        print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = train_one_epoch(
