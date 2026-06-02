@@ -57,10 +57,6 @@ python train.py \
   --image_dir ./public/train/images \
   --val_image_dir ./public/val/images \
   --checkpoint_dir ./models \
-  --img_size 640 \
-  --batch_size 8 \
-  --epochs 20 \
-  --num_workers 2
 ```
 
 Nếu T4 bị CUDA out-of-memory:
@@ -90,8 +86,6 @@ python predict.py \
   --val_annotation ./public/annotations/val.json \
   --output val_predictions.json \
   --model_path ./models/best.pth \
-  --device cuda \
-  --batch_size 16
 ```
 
 Output chính:
