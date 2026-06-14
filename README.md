@@ -1,4 +1,4 @@
-# O_D
+# Object Detection
 
 ## 1. Cài môi trường trên Google Colab
 
