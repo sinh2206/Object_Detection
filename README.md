@@ -1,71 +1,40 @@
-# Object Detection
+# Object Detection with YOLOv8s
 
-## 1. Cài môi trường trên Google Colab
+This project trains an object detector with `yolov8s.pt` on the dataset stored in `public/`.
 
-```bash
+## Dataset layout
 
-!pip install -r requirements.txt
-```
+- `public/train/images`: training images
+- `public/val/images`: validation images
+- `public/annotations/train.json`: training annotations
+- `public/annotations/val.json`: validation annotations
+- `public/classes.json`: class names
 
-Khuyến nghị:
+The annotation files use project-specific `xyxy` boxes, so the notebook converts them to YOLO labels before training.
 
-- vào `Runtime` -> `Change runtime type`
-- chọn `GPU`
+## Recommended workflow
 
-## 2. Cách huấn luyện
+Run [Object_Detection.ipynb](Object_Detection.ipynb) on Google Colab with a T4 GPU runtime.
 
-```bash
-!python train.py \
-  --train_data ./public/annotations/train.json \
-  --val_data ./public/annotations/val.json \
-  --image_dir ./public/train/images \
-  --val_image_dir ./public/val/images \
-  --checkpoint_dir ./models
-```
+The notebook will:
 
-Sau khi train:
+1. clone the repository into Colab
+2. install Ultralytics YOLO
+3. convert `train.json` and `val.json` to YOLO label files
+4. train `yolov8s.pt`
+5. validate the best checkpoint
+6. export validation predictions back to the project JSON format
+7. copy `yolov8s.pt`, `best.pt`, and `last.pt` into `models/`
 
-- mô hình tốt nhất: `models/best.pth`
-- mô hình gần nhất: `models/last.pth`
+## Training artifacts
 
-## 3. Cách chạy suy luận
+After the notebook finishes, the main outputs are:
 
-```bash
-!python predict.py \
-  --image_dir ./public/val/images \
-  --val_annotation ./public/annotations/val.json \
-  --output ./val_predictions.json \
-  --results_dir ./results \
-  --checkpoint ./models/best.pth
-```
+- `models/yolov8s.pt`
+- `models/best.pt`
+- `models/last.pt`
+- `public/dataset_yolov8.yaml`
+- `val_predictions.json`
+- `val_metrics.json`
 
-Kết quả sinh ra:
-
-- file dự đoán: `val_predictions.json`
-- file hardcase: `results/hardcase_summary.json`
-
-## 4. Vị trí đặt mô hình / trọng số mô hình
-
-Đặt file trọng số trong thư mục:
-
-```text
-models/
-```
-
-Ví dụ:
-
-- `models/best.pth`
-- `models/last.pth`
-
-Nếu bạn có trọng số riêng, chỉ cần chép vào `models/` rồi truyền đường dẫn qua `--checkpoint`.
-
-Ví dụ:
-
-```bash
-!python predict.py \
-  --image_dir ./public/val/images \
-  --val_annotation ./public/annotations/val.json \
-  --output ./val_predictions.json \
-  --results_dir ./results \
-  --checkpoint ./models/ten_trong_so_cua_ban.pth
-```
+The full Ultralytics training logs and plots are stored under `runs/`.

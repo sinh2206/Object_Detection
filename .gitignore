@@ -1,9 +1,0 @@
-example/
-example.py
-
-__pycache__/
-*.pyc
-
-models/*.pth
-*.pth
-models/
