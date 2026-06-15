@@ -1,6 +1,6 @@
-# Object Detection with YOLOv8s
+﻿# Object Detection with YOLOv8m
 
-This project trains an object detector with `yolov8s.pt` on the dataset stored in `public/`.
+This project trains an object detector with `yolov8m.pt` on the dataset stored in `public/`.
 
 ## Dataset layout
 
@@ -14,24 +14,24 @@ The annotation files use project-specific `xyxy` boxes, so the notebook converts
 
 ## Recommended workflow
 
-Run [Object_Detection.ipynb](Object_Detection.ipynb) on Google Colab or Kaggle with a T4 GPU runtime.
+Run [Object-Detection.ipynb](Object-Detection.ipynb) on Google Colab or Kaggle with a T4 GPU runtime.
 
 The notebook will:
 
 1. clone the repository into Colab
 2. install Ultralytics YOLO
 3. convert `train.json` and `val.json` to YOLO label files
-4. train `yolov8s.pt`
+4. train `yolov8m.pt`
 5. validate the best checkpoint
 6. export validation predictions back to the project JSON format
 7. export error images and `img_error/img_error.json`
-8. copy `yolov8s.pt`, `best.pt`, and `last.pt` into `models/`
+8. copy `yolov8m.pt`, `best.pt`, and `last.pt` into `models/`
 
 ## Training artifacts
 
 After the notebook finishes, the main outputs are:
 
-- `models/yolov8s.pt`
+- `models/yolov8m.pt`
 - `models/best.pt`
 - `models/last.pt`
 - `public/dataset_yolov8.yaml`
@@ -41,3 +41,4 @@ After the notebook finishes, the main outputs are:
 - `img_error/*.jpg`
 
 The full Ultralytics training logs and plots are stored under `runs/`.
+
