@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+"""
+Shared configuration for the anchor-free object detection project.
+"""
+
+# Input image size used by train/predict unless overridden by CLI.
+IMG_SIZE = 640
+
+# Class vocabulary used across annotations, model heads and exported JSON.
+CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
+NUM_CLASSES = len(CLASS_NAMES)
+CLASS_TO_IDX = {name: i for i, name in enumerate(CLASS_NAMES)}
+
+# Dataset class frequencies (train/val original splits).
+CLASS_FREQ_PRIOR_TRAIN = [0.5477, 0.1258, 0.0966, 0.0783, 0.1516]
+CLASS_FREQ_PRIOR_VAL = [0.5314, 0.1400, 0.1019, 0.0871, 0.1395]
+
+# Class emphasis factors used by train.py to derive final weights from the
+# observed class frequencies.
+CLASS_LOSS_WEIGHTS = [0.50, 1.10, 1.20, 1.35, 1.55]
+CLASS_SAMPLER_WEIGHTS = [0.65, 1.10, 1.25, 1.30, 1.45]
+
+STRIDES = [8, 16, 32]
+FPN_CHANNELS = 128
+
+# ImageNet normalization applied before feeding images to the backbone.
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
+
+# Inference and post-processing thresholds.
+CONF_THRESH = 0.35
+NMS_IOU_THRESH = 0.50
+MAX_OBJECTS_PER_IMAGE = 15
+# Per-class confidence thresholds used after decode/NMS:
+# person, car, dog, cat, chair
+CLASS_CONF_THRESH = [0.35, 0.35, 0.35, 0.34, 0.35]
+MIN_EXPORT_CONF = 0.3
+CLASS_SCORE_SCALES = [0.72, 1.00, 1.05, 1.25, 1.15]
+CHAIR_SUPPRESS_WITH_PERSON_IOU = 0.92
+CHAIR_SUPPRESS_MAX_AREA_RATIO = 0.25
+MIN_BOX_SIZE = 1.0
+DUPLICATE_BOX_SINGLE_COVERAGE = 0.88
+DUPLICATE_BOX_UNION_COVERAGE = 0.88
+DUPLICATE_BOX_MIN_PARTIAL_COVERAGE = 0.18
+DUPLICATE_BOX_MIN_COVERING_BOXES = 2
+DUPLICATE_BOX_MIN_AREA_RATIO = 0.30
+# Extra duplicate filter for crowded car/dog scenes where a lower-confidence
+# shifted box survives IoU-NMS but largely describes an already kept object.
+DUPLICATE_BOX_PAIR_CLASSES = ["car", "dog"]
+DUPLICATE_BOX_PAIR_MIN_CANDIDATE_COVERAGE = 0.55
+DUPLICATE_BOX_PAIR_MIN_SMALLER_COVERAGE = 0.68
+DUPLICATE_BOX_PAIR_MAX_SCORE_RATIO = 0.82
+DUPLICATE_BOX_PAIR_MAX_AREA_RATIO = 1.80
+DUPLICATE_BOX_PAIR_MAX_CENTER_DIST_RATIO = 0.25
+NEGATIVE_FOCAL_WEIGHT = 0.35
+CENTER_RADIUS = 2.0
+INFER_CENTER_COMBINE = "sqrt"
+
+# Small/difficult object handling and low-light preprocessing knobs.
+SMALL_OBJECT_AREA_RATIO = 0.012
+SMALL_OBJECT_BONUS = 0.70
+LOW_LIGHT_MEAN_THRESH = 70.0
+LOW_LIGHT_CLAHE_CLIP = 1.8
+LOW_LIGHT_GAMMA = 0.90
+
+TINY_OBJECT_MAX_SIDE_FACTOR = 2.0
+TINY_ASSIGN_EXPAND_STRIDE = 0.75
+
+# Loss weighting and focal-loss hyperparameters.
+FOCAL_ALPHA = 0.35
+FOCAL_GAMMA = 1.5
+LAMBDA_CLS = 1.25
+LAMBDA_REG = 1.20
+LAMBDA_CTR = 0.30
+LABEL_SMOOTHING = 0.0

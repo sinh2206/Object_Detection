@@ -1,0 +1,9 @@
+example/
+example.py
+
+__pycache__/
+*.pyc
+
+small_obj/*
+main.tex
+models/*
